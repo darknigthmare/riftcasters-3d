@@ -7,6 +7,7 @@ import {
   scoreForKill,
   seededShuffle,
   spawnIntervalForWave,
+  voidPressureRate,
 } from './rules';
 
 describe('combat damage', () => {
@@ -51,6 +52,25 @@ describe('rift pacing', () => {
         .size,
     ).toBe(3);
     expect(nextRiftPosition(4)).toEqual(first);
+  });
+
+  it('turns contesting enemies into pressure while clean channeling relieves it', () => {
+    expect(
+      voidPressureRate({
+        wave: 2,
+        nearbyEnemies: 3,
+        enemyCount: 8,
+        channeling: true,
+      }),
+    ).toBeGreaterThan(0);
+    expect(
+      voidPressureRate({
+        wave: 2,
+        nearbyEnemies: 0,
+        enemyCount: 2,
+        channeling: true,
+      }),
+    ).toBeLessThan(0);
   });
 });
 

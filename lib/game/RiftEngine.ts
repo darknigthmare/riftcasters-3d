@@ -9,9 +9,23 @@ import {
   scoreForKill,
   seededShuffle,
   spawnIntervalForWave,
+  voidPressureRate,
 } from './rules';
+import {
+  affinityUnlockCost,
+  calculateDustReward,
+  createDefaultProfile,
+  isValidCurrentProgression,
+  LEGACY_STORAGE_KEY,
+  PROGRESSION_STORAGE_KEY,
+  readProgression,
+  recalibrationCost,
+  schoolForAffinity,
+} from './progression';
 import type {
   AbilityId,
+  Affinity,
+  AffinityUnlocks,
   EnemyKind,
   GamePhase,
   HudSnapshot,
@@ -150,8 +164,6 @@ const ENEMY_COLORS: Record<EnemyKind, [number, number]> = {
   boss: [0xf05bff, 0x5f0a7c],
 };
 
-const STORAGE_KEY = 'riftcasters-save-v1';
-
 export class RiftEngine {
   private canvas: HTMLCanvasElement;
   private callbacks: Callbacks;
@@ -187,12 +199,24 @@ export class RiftEngine {
   private qaMode = false;
   private wave = 1;
   private riftProgress = 0;
+  private voidPressure = 0;
+  private riftsStabilized = 0;
+  private voidWarningTier = 0;
   private riftTarget = new THREE.Vector3();
   private health = 100;
   private shield = 0;
   private score = 0;
   private highScore = 0;
   private dust = 0;
+  private runsCompleted = 0;
+  private victories = 0;
+  private unlockedAffinities: AffinityUnlocks = {
+    braise: false,
+    prisme: false,
+    neant: false,
+  };
+  private affinity: Affinity = 'none';
+  private storageAvailable = true;
   private ultimate = 0;
   private combo = 0;
   private comboTimer = 0;
@@ -218,6 +242,10 @@ export class RiftEngine {
   private muted = false;
   private audio = new RiftAudio();
   private upgradeRanks = new Map<UpgradeId, number>();
+  private currentUpgradeChoices: UpgradeChoice[] = [];
+  private rerollsThisRun = 0;
+  private lastRerollAt = -Infinity;
+  private gamepadButtons = new Map<number, boolean>();
   private stats: Stats = this.defaultStats();
 
   constructor(canvas: HTMLCanvasElement, callbacks: Callbacks) {
@@ -228,6 +256,8 @@ export class RiftEngine {
       '(prefers-reduced-motion: reduce)',
     ).matches;
     this.loadSave();
+    this.stats = this.defaultStats();
+    this.health = this.stats.maxHealth;
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
@@ -459,6 +489,122 @@ export class RiftEngine {
     this.showMessage('CANALISE LA FAILLE', 2.2);
   }
 
+  returnToMenu() {
+    if (this.phase !== 'gameover' && this.phase !== 'victory') return;
+    this.resetRun();
+    this.ultimate = 0;
+    this.messageTimer = 0;
+    this.message = 'Entre dans la faille';
+    this.setPhase('menu');
+  }
+
+  setAffinity(affinity: Affinity) {
+    if (this.phase !== 'menu') {
+      return {
+        success: false,
+        reason: 'L’affinité ne peut être modifiée que depuis l’Arche.',
+        ...this.getProgression(),
+      };
+    }
+    if (affinity === 'none') {
+      const previousAffinity = this.affinity;
+      this.affinity = 'none';
+      if (!this.saveProgress()) {
+        this.affinity = previousAffinity;
+        this.pushHud(true);
+        return {
+          success: false,
+          reason: 'Sauvegarde indisponible : affinité inchangée.',
+          ...this.getProgression(),
+        };
+      }
+      this.pushHud(true);
+      return {
+        success: true,
+        reason: 'Affinité neutralisée.',
+        ...this.getProgression(),
+      };
+    }
+    const previousDust = this.dust;
+    const previousAffinity = this.affinity;
+    const wasUnlocked = this.unlockedAffinities[affinity];
+    if (!wasUnlocked) {
+      const cost = affinityUnlockCost(affinity);
+      if (this.dust < cost) {
+        return {
+          success: false,
+          reason: `Il faut ${cost} poussières d’éther.`,
+          ...this.getProgression(),
+        };
+      }
+      this.dust -= cost;
+      this.unlockedAffinities[affinity] = true;
+    }
+    this.affinity = affinity;
+    if (!this.saveProgress()) {
+      this.dust = previousDust;
+      this.affinity = previousAffinity;
+      this.unlockedAffinities[affinity] = wasUnlocked;
+      this.pushHud(true);
+      return {
+        success: false,
+        reason: 'Sauvegarde indisponible : aucun serment dépensé.',
+        ...this.getProgression(),
+      };
+    }
+    void this.audio.unlock();
+    this.audio.play('upgrade');
+    this.pushHud(true);
+    return {
+      success: true,
+      reason: 'Affinité accordée.',
+      ...this.getProgression(),
+    };
+  }
+
+  getProgression() {
+    return {
+      dust: this.dust,
+      highScore: this.highScore,
+      runsCompleted: this.runsCompleted,
+      victories: this.victories,
+      affinity: this.affinity,
+      unlockedAffinities: { ...this.unlockedAffinities },
+      affinityCosts: {
+        braise: affinityUnlockCost('braise'),
+        prisme: affinityUnlockCost('prisme'),
+        neant: affinityUnlockCost('neant'),
+      },
+      storageAvailable: this.storageAvailable,
+    };
+  }
+
+  rerollUpgrades() {
+    if (this.phase !== 'upgrade') return false;
+    const now = performance.now();
+    if (now - this.lastRerollAt < 300) return false;
+    const cost = recalibrationCost(this.rerollsThisRun);
+    if (this.dust < cost) return false;
+    const previousChoices = [...this.currentUpgradeChoices];
+    this.dust -= cost;
+    this.rerollsThisRun += 1;
+    this.offerUpgradeChoices(
+      new Set(previousChoices.map((choice) => choice.id)),
+    );
+    if (!this.saveProgress()) {
+      this.dust += cost;
+      this.rerollsThisRun -= 1;
+      this.currentUpgradeChoices = previousChoices;
+      this.callbacks.onUpgrade(previousChoices);
+      this.pushHud(true);
+      return false;
+    }
+    this.lastRerollAt = now;
+    this.audio.play('upgrade');
+    this.pushHud(true);
+    return true;
+  }
+
   togglePause() {
     if (this.phase === 'playing') {
       this.setPhase('paused');
@@ -470,6 +616,8 @@ export class RiftEngine {
 
   chooseUpgrade(id: UpgradeId) {
     if (this.phase !== 'upgrade') return;
+    if (!this.currentUpgradeChoices.some((choice) => choice.id === id)) return;
+    this.currentUpgradeChoices = [];
     const rank = (this.upgradeRanks.get(id) ?? 0) + 1;
     this.upgradeRanks.set(id, rank);
     switch (id) {
@@ -506,7 +654,12 @@ export class RiftEngine {
     this.audio.play('upgrade');
     this.wave += 1;
     this.riftProgress = 0;
+    if (this.wave >= 4) this.voidPressure = 0;
     this.spawnTimer = 0.35;
+    for (const enemy of this.enemies) {
+      enemy.attackTimer = Math.max(enemy.attackTimer, 0.9);
+      enemy.shootTimer = Math.max(enemy.shootTimer, 1.1);
+    }
     this.moveRiftToWave();
     this.setPhase('playing');
     this.showMessage(`RÉSONANCE ${rank} // VAGUE ${this.wave}`, 2.4);
@@ -524,6 +677,7 @@ export class RiftEngine {
     this.muted = muted;
     this.audio.setMuted(muted);
     this.saveProgress();
+    this.pushHud(true);
   }
 
   getMuted() {
@@ -591,6 +745,21 @@ export class RiftEngine {
   }
 
   private onKeyDown = (event: KeyboardEvent) => {
+    const pauseKey = event.code === 'Escape' || event.code === 'KeyP';
+    if (pauseKey && (this.phase === 'playing' || this.phase === 'paused')) {
+      event.preventDefault();
+      this.togglePause();
+      return;
+    }
+    const target = event.target;
+    const interactiveTarget =
+      target instanceof Element &&
+      target.closest(
+        'button, input, textarea, select, a, [contenteditable="true"]',
+      );
+    if (this.phase !== 'playing') return;
+    if (interactiveTarget && (event.code === 'Space' || event.code === 'Enter'))
+      return;
     const blocked = [
       'Space',
       'ArrowUp',
@@ -601,7 +770,6 @@ export class RiftEngine {
     if (blocked.includes(event.code)) event.preventDefault();
     this.keys.add(event.code);
     if (event.repeat) return;
-    if (event.code === 'Escape' || event.code === 'KeyP') this.togglePause();
     if (event.code === 'Space') this.triggerAbility('dash');
     if (event.code === 'KeyE') this.triggerAbility('shield');
     if (event.code === 'KeyR') this.triggerAbility('ultimate');
@@ -614,6 +782,7 @@ export class RiftEngine {
   private onWindowBlur = () => {
     this.keys.clear();
     this.mouseHeld = false;
+    this.gamepadButtons.clear();
     if (this.phase === 'playing') this.setPhase('paused');
   };
 
@@ -651,6 +820,67 @@ export class RiftEngine {
     this.camera.updateProjectionMatrix();
   };
 
+  private getActiveGamepad() {
+    const gamepads = navigator.getGamepads?.();
+    if (!gamepads) return null;
+    for (const gamepad of gamepads) {
+      if (gamepad?.connected) return gamepad;
+    }
+    return null;
+  }
+
+  private updateGamepadActions() {
+    const gamepad = this.getActiveGamepad();
+    if (!gamepad) {
+      this.gamepadButtons.clear();
+      return;
+    }
+    const justPressed = (buttonIndex: number) => {
+      const pressed = (gamepad.buttons[buttonIndex]?.value ?? 0) > 0.35;
+      const wasPressed = this.gamepadButtons.get(buttonIndex) ?? false;
+      this.gamepadButtons.set(buttonIndex, pressed);
+      return pressed && !wasPressed;
+    };
+    const confirmPressed = justPressed(0);
+    const thirdChoicePressed = justPressed(1);
+    const secondChoicePressed = justPressed(2);
+    const ultimatePressed = justPressed(3);
+    const shieldPressed = justPressed(4);
+    const gravityPressed = justPressed(6);
+    const pausePressed = justPressed(9);
+
+    if (pausePressed && (this.phase === 'playing' || this.phase === 'paused')) {
+      this.togglePause();
+    }
+    if (confirmPressed) {
+      if (this.phase === 'menu' && !document.querySelector('dialog[open]')) {
+        this.start();
+      } else if (this.phase === 'paused') {
+        this.togglePause();
+      } else if (this.phase === 'playing') {
+        this.triggerAbility('dash');
+      } else if (this.phase === 'upgrade') {
+        const choice = this.currentUpgradeChoices[0];
+        if (choice) this.chooseUpgrade(choice.id);
+      } else if (this.phase === 'gameover' || this.phase === 'victory') {
+        this.start();
+      }
+    }
+    if (this.phase === 'upgrade' && secondChoicePressed) {
+      const choice = this.currentUpgradeChoices[1];
+      if (choice) this.chooseUpgrade(choice.id);
+    }
+    if (this.phase === 'upgrade' && thirdChoicePressed) {
+      const choice = this.currentUpgradeChoices[2];
+      if (choice) this.chooseUpgrade(choice.id);
+    }
+    if (this.phase === 'playing') {
+      if (ultimatePressed) this.triggerAbility('ultimate');
+      if (shieldPressed) this.triggerAbility('shield');
+      if (gravityPressed) this.triggerAbility('gravity');
+    }
+  }
+
   private loop = () => {
     this.animationFrame = requestAnimationFrame(this.loop);
     const now = performance.now() / 1000;
@@ -659,6 +889,7 @@ export class RiftEngine {
     this.visualElapsed += delta;
     const elapsed = this.visualElapsed;
 
+    this.updateGamepadActions();
     this.updateVisuals(delta, elapsed);
     if (this.phase === 'playing') {
       this.updateGame(delta);
@@ -710,11 +941,12 @@ export class RiftEngine {
       const nearest = this.getNearestEnemy();
       if (nearest) {
         this.aimPoint.lerp(nearest.group.position, 0.62);
+        this.clampAimPointToArena();
         this.aimMarker.position.set(this.aimPoint.x, 0.025, this.aimPoint.z);
         return;
       }
     }
-    const gamepad = navigator.getGamepads?.()[0];
+    const gamepad = this.getActiveGamepad();
     const gamepadAimX = gamepad?.axes[2] ?? 0;
     const gamepadAimY = gamepad?.axes[3] ?? 0;
     if (Math.abs(gamepadAimX) + Math.abs(gamepadAimY) > 0.3) {
@@ -723,6 +955,7 @@ export class RiftEngine {
         0,
         this.player.position.z + gamepadAimY * 6,
       );
+      this.clampAimPointToArena();
       this.aimMarker.position.set(this.aimPoint.x, 0.025, this.aimPoint.z);
       return;
     }
@@ -731,7 +964,15 @@ export class RiftEngine {
     if (this.raycaster.ray.intersectPlane(this.groundPlane, target)) {
       this.aimPoint.lerp(target, 0.42);
     }
+    this.clampAimPointToArena();
     this.aimMarker.position.set(this.aimPoint.x, 0.025, this.aimPoint.z);
+  }
+
+  private clampAimPointToArena() {
+    const radius = Math.hypot(this.aimPoint.x, this.aimPoint.z);
+    if (radius <= 9.1) return;
+    this.aimPoint.x *= 9.1 / radius;
+    this.aimPoint.z *= 9.1 / radius;
   }
 
   private updatePlayer(delta: number) {
@@ -755,7 +996,7 @@ export class RiftEngine {
       vertical + this.touchMove.y,
     );
 
-    const gamepad = navigator.getGamepads?.()[0];
+    const gamepad = this.getActiveGamepad();
     if (gamepad) {
       if (Math.abs(gamepad.axes[0] ?? 0) > 0.16) move.x += gamepad.axes[0];
       if (Math.abs(gamepad.axes[1] ?? 0) > 0.16) move.z += gamepad.axes[1];
@@ -816,6 +1057,35 @@ export class RiftEngine {
         enemy.kind !== 'boss' &&
         distance2D(enemy.group.position, this.riftTarget) < 3.5,
     ).length;
+    const pressureScale = this.qaMode ? 0.2 : 1;
+    this.voidPressure = clamp(
+      this.voidPressure +
+        voidPressureRate({
+          wave: this.wave,
+          nearbyEnemies: nearby,
+          enemyCount: this.enemies.length,
+          channeling,
+        }) *
+          delta *
+          pressureScale,
+      0,
+      100,
+    );
+    const pressureTier =
+      this.voidPressure >= 75 ? 3 : this.voidPressure >= 50 ? 2 : 1;
+    if (pressureTier > this.voidWarningTier && pressureTier >= 2) {
+      this.showMessage(
+        pressureTier === 3
+          ? 'RUPTURE DE L’ARCHE IMMINENTE'
+          : 'PRESSION DU NÉANT EN HAUSSE',
+        2.2,
+      );
+    }
+    this.voidWarningTier = pressureTier;
+    if (this.voidPressure >= 100) {
+      this.finishRun(false, 'void');
+      return;
+    }
     const multiplier = this.qaMode ? 4.8 : 1;
     this.riftProgress = clamp(
       this.riftProgress +
@@ -831,25 +1101,75 @@ export class RiftEngine {
   }
 
   private completeWave() {
+    this.riftsStabilized += 1;
     this.score += 750 * this.wave;
     this.ultimate = clamp(this.ultimate + 24, 0, 100);
-    this.enemies.forEach((enemy) => {
-      this.spawnParticles(enemy.group.position, ENEMY_COLORS[enemy.kind][0], 5);
-      this.enemyRoot.remove(enemy.group);
-      this.disposeObject(enemy.group);
-    });
-    this.enemies = [];
+    this.voidPressure = Math.max(0, this.voidPressure - 28);
+    this.voidWarningTier =
+      this.voidPressure >= 75 ? 3 : this.voidPressure >= 50 ? 2 : 1;
+    this.createBlast(this.riftTarget, 4.2, 0, 0x72efff);
+    for (const enemy of this.enemies) {
+      if (enemy.kind === 'boss') continue;
+      const recoil = enemy.group.position.clone().sub(this.riftTarget).setY(0);
+      const distance = recoil.length();
+      if (distance > 4.6) continue;
+      if (distance < 0.05) recoil.set(1, 0, 0);
+      recoil.normalize();
+      enemy.group.position.addScaledVector(
+        recoil,
+        Math.max(0.8, 4.8 - distance),
+      );
+      const arenaRadius = Math.hypot(
+        enemy.group.position.x,
+        enemy.group.position.z,
+      );
+      if (arenaRadius > 9.65) {
+        enemy.group.position.x *= 9.65 / arenaRadius;
+        enemy.group.position.z *= 9.65 / arenaRadius;
+      }
+    }
     this.clearHostileProjectiles();
     this.audio.play('rift');
     this.showMessage(`FAILLE ${this.wave} STABILISÉE`, 2.5);
-    const choices = seededShuffle(
-      UPGRADE_LIBRARY.filter(
-        (choice) => (this.upgradeRanks.get(choice.id) ?? 0) < 3,
-      ),
-      Math.floor(this.score + this.elapsed * 10 + this.wave * 113),
-    ).slice(0, 3);
-    this.callbacks.onUpgrade(choices);
+    this.offerUpgradeChoices();
     this.setPhase('upgrade');
+  }
+
+  private offerUpgradeChoices(excludedIds = new Set<UpgradeId>()) {
+    const allAvailable = UPGRADE_LIBRARY.filter(
+      (choice) => (this.upgradeRanks.get(choice.id) ?? 0) < 3,
+    );
+    const shuffled = seededShuffle(
+      allAvailable,
+      Math.floor(
+        this.score +
+          this.elapsed * 10 +
+          this.wave * 113 +
+          this.rerollsThisRun * 7919,
+      ),
+    );
+    const freshChoices = shuffled.filter(
+      (choice) => !excludedIds.has(choice.id),
+    );
+    const favoredSchool = schoolForAffinity(this.affinity);
+    const favored = favoredSchool
+      ? (freshChoices.find((choice) => choice.school === favoredSchool) ??
+        shuffled.find((choice) => choice.school === favoredSchool))
+      : undefined;
+    const orderedPool = [
+      ...freshChoices,
+      ...shuffled.filter((choice) => excludedIds.has(choice.id)),
+    ];
+    const choices = favored
+      ? [
+          favored,
+          ...orderedPool
+            .filter((choice) => choice.id !== favored.id)
+            .slice(0, 2),
+        ]
+      : orderedPool.slice(0, 3);
+    this.currentUpgradeChoices = choices;
+    this.callbacks.onUpgrade(choices);
   }
 
   private rollEnemyKind(): EnemyKind {
@@ -1068,6 +1388,7 @@ export class RiftEngine {
           );
         } else if (enemy.healTimer <= 0) {
           this.riftProgress = Math.max(0, this.riftProgress - 2.5);
+          this.voidPressure = clamp(this.voidPressure + 2.4, 0, 100);
           const boss = this.enemies.find((target) => target.kind === 'boss');
           if (boss) boss.hp = Math.min(boss.maxHp, boss.hp + 18);
           this.spawnParticles(enemy.group.position, 0x9bff83, 3);
@@ -1156,6 +1477,12 @@ export class RiftEngine {
       0,
       100,
     );
+    if (this.wave < 4) {
+      this.voidPressure = Math.max(
+        0,
+        this.voidPressure - (enemy.kind === 'leech' ? 4.5 : 1.2),
+      );
+    }
     this.audio.play('kill');
 
     if (enemy.kind === 'boss') this.finishRun(true);
@@ -1401,6 +1728,15 @@ export class RiftEngine {
       0,
       vertical + this.touchMove.y,
     );
+    const gamepad = this.getActiveGamepad();
+    if (gamepad) {
+      if (Math.abs(gamepad.axes[0] ?? 0) > 0.16) {
+        direction.x += gamepad.axes[0];
+      }
+      if (Math.abs(gamepad.axes[1] ?? 0) > 0.16) {
+        direction.z += gamepad.axes[1];
+      }
+    }
     if (direction.lengthSq() < 0.05) {
       direction.copy(this.aimPoint).sub(this.player.position).setY(0);
     }
@@ -1483,6 +1819,7 @@ export class RiftEngine {
           radius + enemy.radius
         ) {
           this.damageEnemy(enemy, damage, enemy.group.position);
+          if (this.phase !== 'playing') break;
         }
       }
     }
@@ -1540,6 +1877,7 @@ export class RiftEngine {
             );
             if (area.tick <= 0) {
               this.damageEnemy(enemy, area.damage, enemy.group.position);
+              if (this.phase !== 'playing') break;
             }
           }
         }
@@ -1687,6 +2025,12 @@ export class RiftEngine {
     this.upgradeRanks.clear();
     this.wave = 1;
     this.riftProgress = 0;
+    this.voidPressure = 0;
+    this.riftsStabilized = 0;
+    this.voidWarningTier = 0;
+    this.rerollsThisRun = 0;
+    this.lastRerollAt = -Infinity;
+    this.currentUpgradeChoices = [];
     this.health = this.stats.maxHealth;
     this.shield = 0;
     this.score = 0;
@@ -1709,6 +2053,7 @@ export class RiftEngine {
     this.mouseHeld = false;
     this.touchAttack = false;
     this.touchMove.set(0, 0);
+    this.gamepadButtons.clear();
     this.shieldMesh.visible = false;
     this.moveRiftToWave();
     this.lastFrameTime = performance.now() / 1000;
@@ -1722,20 +2067,32 @@ export class RiftEngine {
     this.riftLight.position.set(target.x, 2.15, target.z);
   }
 
-  private finishRun(victory: boolean) {
+  private finishRun(
+    victory: boolean,
+    defeatReason: 'integrity' | 'void' = 'integrity',
+  ) {
     if (this.phase !== 'playing') return;
     this.mouseHeld = false;
     this.touchAttack = false;
-    this.highScore = Math.max(this.highScore, this.score);
-    const earned = Math.max(
-      1,
-      Math.floor(this.score / 650) + this.wave * (victory ? 3 : 1),
-    );
-    this.dust += earned;
-    this.saveProgress();
+    const earned = this.qaMode
+      ? 0
+      : calculateDustReward({
+          score: this.score,
+          riftsStabilized: this.riftsStabilized,
+          victory,
+        });
+    if (!this.qaMode) {
+      this.highScore = Math.max(this.highScore, this.score);
+      this.runsCompleted += 1;
+      if (victory) this.victories += 1;
+      this.dust += earned;
+      this.saveProgress();
+    }
     this.message = victory
       ? `ARCHE SAUVÉE // +${earned} POUSSIÈRES`
-      : `TRAME ROMPUE // +${earned} POUSSIÈRES`;
+      : defeatReason === 'void'
+        ? `LE NÉANT A TRAVERSÉ // +${earned} POUSSIÈRES`
+        : `TRAME ROMPUE // +${earned} POUSSIÈRES`;
     this.setPhase(victory ? 'victory' : 'gameover');
     this.pushHud(true);
   }
@@ -1804,6 +2161,12 @@ export class RiftEngine {
     if (!force && this.elapsed - this.lastHudPush < 0.08) return;
     this.lastHudPush = this.elapsed;
     const boss = this.enemies.find((enemy) => enemy.kind === 'boss');
+    const build = Array.from(this.upgradeRanks.entries()).flatMap(
+      ([id, rank]) => {
+        const choice = UPGRADE_LIBRARY.find((entry) => entry.id === id);
+        return choice ? [{ ...choice, rank }] : [];
+      },
+    );
     this.callbacks.onHud({
       health: this.health,
       maxHealth: this.stats.maxHealth,
@@ -1812,6 +2175,8 @@ export class RiftEngine {
       score: this.score,
       wave: this.wave,
       riftProgress: this.riftProgress,
+      voidPressure: this.voidPressure,
+      riftsStabilized: this.riftsStabilized,
       enemies: this.enemies.length,
       ultimate: this.ultimate,
       dashCharges: this.dashCharges,
@@ -1820,6 +2185,17 @@ export class RiftEngine {
       elapsed: this.elapsed,
       highScore: this.highScore,
       dust: this.dust,
+      runsCompleted: this.runsCompleted,
+      victories: this.victories,
+      affinity: this.affinity,
+      unlockedAffinities: { ...this.unlockedAffinities },
+      storageAvailable: this.storageAvailable,
+      upgradeRanks: Object.fromEntries(this.upgradeRanks),
+      build,
+      rerollCost:
+        this.phase === 'upgrade'
+          ? recalibrationCost(this.rerollsThisRun)
+          : null,
       combo: this.combo,
       bossHealth: boss ? clamp((boss.hp / boss.maxHp) * 100, 0, 100) : null,
       message:
@@ -1829,35 +2205,55 @@ export class RiftEngine {
 
   private loadSave() {
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as {
-        highScore?: number;
-        dust?: number;
-        muted?: boolean;
-      };
-      this.highScore = Math.max(0, Number(parsed.highScore) || 0);
-      this.dust = Math.max(0, Number(parsed.dust) || 0);
-      this.muted = Boolean(parsed.muted);
+      const currentRaw = window.localStorage.getItem(PROGRESSION_STORAGE_KEY);
+      const legacyRaw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+      const profile = readProgression(currentRaw, legacyRaw);
+      this.highScore = profile.highScore;
+      this.dust = profile.dust;
+      this.muted = profile.muted;
+      this.runsCompleted = profile.runsCompleted;
+      this.victories = profile.victories;
+      this.unlockedAffinities = { ...profile.unlockedAffinities };
+      this.affinity = profile.equippedAffinity;
       this.audio.setMuted(this.muted);
+      if (!isValidCurrentProgression(currentRaw) && legacyRaw) {
+        this.saveProgress();
+      }
     } catch {
-      this.highScore = 0;
-      this.dust = 0;
+      const profile = createDefaultProfile();
+      this.highScore = profile.highScore;
+      this.dust = profile.dust;
+      this.muted = profile.muted;
+      this.runsCompleted = profile.runsCompleted;
+      this.victories = profile.victories;
+      this.unlockedAffinities = { ...profile.unlockedAffinities };
+      this.affinity = profile.equippedAffinity;
+      this.storageAvailable = false;
     }
   }
 
   private saveProgress() {
+    if (this.qaMode) return true;
     try {
       window.localStorage.setItem(
-        STORAGE_KEY,
+        PROGRESSION_STORAGE_KEY,
         JSON.stringify({
+          version: 2,
           highScore: this.highScore,
           dust: this.dust,
           muted: this.muted,
+          runsCompleted: this.runsCompleted,
+          victories: this.victories,
+          unlockedAffinities: this.unlockedAffinities,
+          equippedAffinity: this.affinity,
         }),
       );
+      this.storageAvailable = true;
+      return true;
     } catch {
       // Local storage can be unavailable in private browsing; the run remains playable.
+      this.storageAvailable = false;
+      return false;
     }
   }
 

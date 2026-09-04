@@ -2,17 +2,21 @@
 
 import {
   Crosshair,
+  Flame,
+  Gem,
   Heart,
   Move,
   Orbit,
   Pause,
   Play,
   RotateCcw,
+  RefreshCw,
   Shield,
   Sparkles,
   Volume2,
   VolumeX,
   Wind,
+  X,
   Zap,
 } from 'lucide-react';
 import {
@@ -22,9 +26,11 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { Button } from '@/components/ui/button';
+import { affinityUnlockCost, recalibrationCost } from '@/lib/game/progression';
 import type { RiftEngine as RiftEngineType } from '@/lib/game/RiftEngine';
 import type {
   AbilityId,
+  AffinityId,
   GamePhase,
   HudSnapshot,
   UpgradeChoice,
@@ -38,6 +44,8 @@ const EMPTY_HUD: HudSnapshot = {
   score: 0,
   wave: 1,
   riftProgress: 0,
+  voidPressure: 0,
+  riftsStabilized: 0,
   enemies: 0,
   ultimate: 0,
   dashCharges: 2,
@@ -46,6 +54,18 @@ const EMPTY_HUD: HudSnapshot = {
   elapsed: 0,
   highScore: 0,
   dust: 0,
+  runsCompleted: 0,
+  victories: 0,
+  affinity: 'none',
+  unlockedAffinities: {
+    braise: false,
+    prisme: false,
+    neant: false,
+  },
+  storageAvailable: true,
+  upgradeRanks: {},
+  build: [],
+  rerollCost: null,
   combo: 0,
   bossHealth: null,
   message: 'Entre dans la faille',
@@ -57,6 +77,46 @@ const UPGRADE_ICONS = {
   void: Orbit,
   heart: Heart,
   dash: Wind,
+};
+
+const AFFINITIES = [
+  {
+    id: 'braise',
+    school: 'BRAISE',
+    title: 'Serment incandescent',
+    description:
+      'Garantit une résonance de Braise dans chaque sélection de la transmission.',
+    icon: Flame,
+  },
+  {
+    id: 'prisme',
+    school: 'PRISME',
+    title: 'Serment prismatique',
+    description:
+      'Garantit une résonance de Prisme dans chaque sélection de la transmission.',
+    icon: Shield,
+  },
+  {
+    id: 'neant',
+    school: 'NÉANT',
+    title: 'Serment abyssal',
+    description:
+      'Garantit une résonance du Néant dans chaque sélection de la transmission.',
+    icon: Orbit,
+  },
+] satisfies Array<{
+  id: AffinityId;
+  school: string;
+  title: string;
+  description: string;
+  icon: typeof Flame;
+}>;
+
+const AFFINITY_LABELS = {
+  none: 'AUCUNE',
+  braise: 'BRAISE',
+  prisme: 'PRISME',
+  neant: 'NÉANT',
 };
 
 function formatScore(score: number) {
@@ -76,6 +136,8 @@ export function RiftcastersExperience() {
   const hudRef = useRef<HudSnapshot>(EMPTY_HUD);
   const stickRef = useRef<HTMLDivElement>(null);
   const upgradeDialogRef = useRef<HTMLDialogElement>(null);
+  const archiveDialogRef = useRef<HTMLDialogElement>(null);
+  const archiveWasOpenRef = useRef(false);
   const stickPointerRef = useRef<number | null>(null);
   const webMcpAttemptsRef = useRef(0);
   const [phase, setPhase] = useState<GamePhase>('menu');
@@ -84,6 +146,7 @@ export function RiftcastersExperience() {
   const [muted, setMuted] = useState(false);
   const [ready, setReady] = useState(false);
   const [webglError, setWebglError] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const [stickPosition, setStickPosition] = useState({ x: 0, y: 0 });
   const [webMcpEpoch, setWebMcpEpoch] = useState(0);
 
@@ -104,6 +167,7 @@ export function RiftcastersExperience() {
               stickPointerRef.current = null;
               setStickPosition({ x: 0, y: 0 });
             }
+            if (nextPhase !== 'menu') setArchiveOpen(false);
           },
           onUpgrade: setUpgrades,
         });
@@ -142,6 +206,33 @@ export function RiftcastersExperience() {
       });
     }
   }, [phase]);
+
+  useEffect(() => {
+    if (!archiveOpen) {
+      if (archiveWasOpenRef.current) {
+        archiveWasOpenRef.current = false;
+        queueMicrotask(() => {
+          document
+            .querySelector<HTMLButtonElement>('[data-archive-trigger]')
+            ?.focus();
+        });
+      }
+      return;
+    }
+    archiveWasOpenRef.current = true;
+    queueMicrotask(() => {
+      archiveDialogRef.current
+        ?.querySelector<HTMLButtonElement>('button:not(:disabled)')
+        ?.focus();
+    });
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.code !== 'Escape') return;
+      event.preventDefault();
+      setArchiveOpen(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [archiveOpen]);
 
   useEffect(() => {
     hudRef.current = hud;
@@ -223,7 +314,81 @@ export function RiftcastersExperience() {
                 score: current.score,
                 health: Math.ceil(current.health),
                 riftProgress: Math.floor(current.riftProgress),
+                voidPressure: Math.ceil(current.voidPressure),
+                riftsStabilized: current.riftsStabilized,
                 enemies: current.enemies,
+                dust: current.dust,
+                affinity: current.affinity,
+              };
+            },
+          },
+          { signal: lifecycle.signal },
+        ),
+        context.registerTool(
+          {
+            name: 'configure_riftcasters_affinity',
+            title: 'Configurer l’affinité RIFTCASTERS',
+            description:
+              'Depuis l’Arche, débloque puis équipe une affinité de Braise, Prisme ou Néant, ou revient à une trame neutre.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                affinity: {
+                  type: 'string',
+                  enum: ['none', 'braise', 'prisme', 'neant'],
+                },
+              },
+              required: ['affinity'],
+              additionalProperties: false,
+            },
+            annotations: {
+              readOnlyHint: false,
+              untrustedContentHint: false,
+            },
+            execute(input) {
+              const affinity =
+                input && typeof input === 'object' && !Array.isArray(input)
+                  ? (input as { affinity?: unknown }).affinity
+                  : undefined;
+              if (
+                affinity !== 'none' &&
+                affinity !== 'braise' &&
+                affinity !== 'prisme' &&
+                affinity !== 'neant'
+              ) {
+                throw new Error('Affinité invalide.');
+              }
+              const engine = engineRef.current;
+              if (!engine) throw new Error('Le moteur 3D n’est pas prêt.');
+              return engine.setAffinity(affinity);
+            },
+          },
+          { signal: lifecycle.signal },
+        ),
+        context.registerTool(
+          {
+            name: 'reroll_riftcasters_resonances',
+            title: 'Recalibrer les résonances RIFTCASTERS',
+            description:
+              'Pendant un choix de résonance, dépense la poussière requise pour générer trois nouvelles offres.',
+            inputSchema: {
+              type: 'object',
+              properties: {},
+              additionalProperties: false,
+            },
+            annotations: {
+              readOnlyHint: false,
+              untrustedContentHint: false,
+            },
+            execute(input) {
+              requireEmptyObject(input);
+              const engine = engineRef.current;
+              if (!engine) throw new Error('Le moteur 3D n’est pas prêt.');
+              const success = engine.rerollUpgrades();
+              return {
+                success,
+                ...engine.getProgression(),
+                gameState: engine.getPhase(),
               };
             },
           },
@@ -301,7 +466,7 @@ export function RiftcastersExperience() {
         <small>{'// ARCHIVE 07'}</small>
       </header>
 
-      {phase !== 'paused' && phase !== 'upgrade' && (
+      {phase !== 'paused' && phase !== 'upgrade' && !archiveOpen && (
         <div className="top-actions">
           {phase === 'playing' && (
             <Button
@@ -330,7 +495,7 @@ export function RiftcastersExperience() {
         </div>
       )}
 
-      {phase === 'menu' && (
+      {phase === 'menu' && !archiveOpen && (
         <section className="start-panel" aria-labelledby="game-title">
           <div className="eyebrow">
             <span /> TRANSMISSION INSTABLE
@@ -342,7 +507,8 @@ export function RiftcastersExperience() {
           </h1>
           <p className="game-premise">
             Trois failles rongent l&apos;Arche. Entre dans l&apos;arène,
-            canalise leurs gardiens et empêche le Néant de traverser.
+            canalise leurs gardiens et empêche le Néant de traverser. Élimine
+            les contestataires avant que sa pression atteigne 100&nbsp;%.
           </p>
           <Button
             className="play-button"
@@ -372,8 +538,136 @@ export function RiftcastersExperience() {
             <span>
               POUSSIÈRE D&apos;ÉTHER <strong>{hud.dust}</strong>
             </span>
+            <span>
+              TRANSMISSIONS <strong>{hud.runsCompleted}</strong>
+            </span>
+            <span>
+              VICTOIRES <strong>{hud.victories}</strong>
+            </span>
+            <span>
+              AFFINITÉ <strong>{AFFINITY_LABELS[hud.affinity]}</strong>
+            </span>
           </div>
+          <Button
+            variant="ghost"
+            className="archive-trigger"
+            data-archive-trigger
+            type="button"
+            onClick={() => setArchiveOpen(true)}
+          >
+            <Gem /> OUVRIR L&apos;ARCHIVE DE L&apos;ARCHE
+          </Button>
+          {!hud.storageAvailable && (
+            <output className="storage-warning">
+              Sauvegarde indisponible : progression limitée à cette session.
+            </output>
+          )}
         </section>
+      )}
+
+      {phase === 'menu' && archiveOpen && (
+        <dialog
+          ref={archiveDialogRef}
+          open
+          className="archive-overlay"
+          aria-modal="true"
+          aria-labelledby="archive-title"
+          aria-describedby="archive-description"
+          onCancel={(event) => {
+            event.preventDefault();
+            setArchiveOpen(false);
+          }}
+        >
+          <section className="archive-panel">
+            <Button
+              variant="ghost"
+              size="icon-lg"
+              className="archive-close"
+              type="button"
+              aria-label="Fermer l’Archive de l’Arche"
+              onClick={() => setArchiveOpen(false)}
+            >
+              <X />
+            </Button>
+            <div className="archive-heading">
+              <span className="modal-eyebrow">MÉTA-PROGRESSION</span>
+              <h2 id="archive-title">ARCHIVE DE L&apos;ARCHE</h2>
+              <p id="archive-description">
+                Débloque un serment avec la poussière gagnée en mission. Une
+                seule affinité peut guider tes choix de résonance.
+              </p>
+            </div>
+            <div className="archive-wallet" aria-label="Poussière disponible">
+              <Gem />
+              <span>POUSSIÈRE DISPONIBLE</span>
+              <strong>{hud.dust}</strong>
+            </div>
+            {!hud.storageAvailable && (
+              <output className="storage-warning archive-storage-warning">
+                Sauvegarde indisponible : achats et recalibrages sont suspendus.
+              </output>
+            )}
+            <div className="affinity-grid">
+              {AFFINITIES.map((entry) => {
+                const Icon = entry.icon;
+                const unlocked = hud.unlockedAffinities[entry.id];
+                const active = hud.affinity === entry.id;
+                const cost = affinityUnlockCost(entry.id);
+                return (
+                  <Button
+                    key={entry.id}
+                    variant="ghost"
+                    className={`affinity-card affinity-${entry.id}${active ? ' is-active' : ''}`}
+                    type="button"
+                    disabled={
+                      !hud.storageAvailable ||
+                      active ||
+                      (!unlocked && hud.dust < cost)
+                    }
+                    aria-label={`${entry.title}. ${
+                      active
+                        ? 'Affinité active'
+                        : unlocked
+                          ? 'Équiper'
+                          : `Débloquer pour ${cost} poussières`
+                    }`}
+                    onClick={() => engineRef.current?.setAffinity(entry.id)}
+                  >
+                    <span className="affinity-icon">
+                      <Icon />
+                    </span>
+                    <small>{entry.school}</small>
+                    <strong>{entry.title}</strong>
+                    <span>{entry.description}</span>
+                    <em>
+                      {active
+                        ? 'ACCORDÉE'
+                        : unlocked
+                          ? 'ACCORDER'
+                          : `DÉBLOQUER // ${cost} ✦`}
+                    </em>
+                  </Button>
+                );
+              })}
+            </div>
+            <div className="archive-footer">
+              <p>
+                Les affinités orientent les choix sans augmenter directement les
+                dégâts : chaque victoire reste fondée sur ton build.
+              </p>
+              {hud.affinity !== 'none' && (
+                <button
+                  className="text-action"
+                  type="button"
+                  disabled={!hud.storageAvailable}
+                  onClick={() => engineRef.current?.setAffinity('none')}
+                >
+                  DÉSACCORDER L&apos;AFFINITÉ
+                </button>
+              )}
+            </div>
+          </section>
+        </dialog>
       )}
 
       {phase === 'playing' && (
@@ -399,6 +693,19 @@ export function RiftcastersExperience() {
               max={100}
               value={Math.round(hud.bossHealth ?? hud.riftProgress)}
             />
+            {hud.bossHealth === null && (
+              <div
+                className={`void-pressure${hud.voidPressure >= 75 ? ' is-critical' : ''}`}
+              >
+                <span>PRESSION DU NÉANT</span>
+                <strong>{Math.ceil(hud.voidPressure)}%</strong>
+                <progress
+                  aria-label="Pression du Néant sur l’Arche"
+                  max={100}
+                  value={Math.round(hud.voidPressure)}
+                />
+              </div>
+            )}
           </section>
 
           <section className="score-stack" data-testid="hud-score">
@@ -539,7 +846,10 @@ export function RiftcastersExperience() {
           <div className="upgrade-heading">
             <span>FAILLE STABILISÉE</span>
             <h2 id="upgrade-title">CHOISIS UNE RÉSONANCE</h2>
-            <p>Elle façonnera le reste de cette transmission.</p>
+            <p>
+              Elle façonnera le reste de cette transmission. Affinité&nbsp;:{' '}
+              <strong>{AFFINITY_LABELS[hud.affinity]}</strong>
+            </p>
           </div>
           <div className="upgrade-grid">
             {upgrades.map((upgrade, index) => {
@@ -551,9 +861,11 @@ export function RiftcastersExperience() {
                   className={`upgrade-card school-${upgrade.school.toLowerCase().replace('é', 'e')}`}
                   onClick={() => engineRef.current?.chooseUpgrade(upgrade.id)}
                 >
-                  <span className="upgrade-index">0{index + 1}</span>
+                  <span className="upgrade-index">
+                    0{index + 1} · {['A', 'X', 'B'][index]}
+                  </span>
                   <Icon />
-                  <small>{upgrade.school}</small>
+                  <small>{`${upgrade.school} // RANG ${(hud.upgradeRanks[upgrade.id] ?? 0) + 1}`}</small>
                   <strong>{upgrade.title}</strong>
                   <span className="upgrade-description">
                     {upgrade.description}
@@ -562,6 +874,27 @@ export function RiftcastersExperience() {
                 </Button>
               );
             })}
+          </div>
+          <div className="upgrade-actions">
+            <Button
+              variant="ghost"
+              className="reroll-button"
+              type="button"
+              disabled={
+                !hud.storageAvailable ||
+                hud.dust < (hud.rerollCost ?? recalibrationCost(0))
+              }
+              onClick={() => engineRef.current?.rerollUpgrades()}
+            >
+              <RefreshCw />
+              RECALIBRER // {hud.rerollCost ?? recalibrationCost(0)} ✦
+            </Button>
+            <span>{hud.dust} POUSSIÈRES DISPONIBLES</span>
+            {!hud.storageAvailable && (
+              <output className="storage-warning upgrade-storage-warning">
+                Recalibrage suspendu : sauvegarde indisponible.
+              </output>
+            )}
           </div>
         </dialog>
       )}
@@ -582,11 +915,36 @@ export function RiftcastersExperience() {
             <span>
               DURÉE <strong>{formatTime(hud.elapsed)}</strong>
             </span>
+            <span>
+              FAILLES <strong>{hud.riftsStabilized}/3</strong>
+            </span>
           </div>
+          {hud.build.length > 0 && (
+            <div className="result-build" aria-label="Build de la transmission">
+              <span>RÉSONANCES</span>
+              <div>
+                {hud.build.map((entry) => (
+                  <small
+                    key={entry.id}
+                    className={`school-${entry.school.toLowerCase().replace('é', 'e')}`}
+                  >
+                    {entry.title} · R{entry.rank}
+                  </small>
+                ))}
+              </div>
+            </div>
+          )}
           <p>{hud.message}</p>
           <Button className="play-button" size="lg" onClick={start}>
             <RotateCcw /> NOUVELLE TRANSMISSION
           </Button>
+          <button
+            className="text-action"
+            type="button"
+            onClick={() => engineRef.current?.returnToMenu()}
+          >
+            <Gem /> RETOUR À L&apos;ARCHE
+          </button>
         </OverlayPanel>
       )}
 
@@ -626,6 +984,7 @@ function AbilityButton({
       disabled={disabled}
       aria-label={`${label}${cooldown > 0 ? `, recharge ${Math.ceil(cooldown)} secondes` : ''}`}
       onClick={onClick}
+      onPointerUp={(event) => event.currentTarget.blur()}
     >
       <kbd>{keyLabel}</kbd>
       <i>{icon}</i>

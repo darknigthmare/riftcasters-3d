@@ -40,6 +40,28 @@ export function riftCaptureRate(nearbyEnemies: number, channeling = true) {
   return 9 / (1 + Math.max(0, nearbyEnemies) * 0.32);
 }
 
+export function voidPressureRate({
+  wave,
+  nearbyEnemies,
+  enemyCount,
+  channeling,
+}: {
+  wave: number;
+  nearbyEnemies: number;
+  enemyCount: number;
+  channeling: boolean;
+}) {
+  const basePressure = 0.16 + Math.max(0, wave - 1) * 0.035;
+  const contestPressure = Math.max(0, nearbyEnemies) * 0.58;
+  const swarmPressure = Math.max(0, enemyCount - 8) * 0.045;
+  const channelingRelief = channeling ? 0.42 : 0;
+  return clamp(
+    basePressure + contestPressure + swarmPressure - channelingRelief,
+    -0.5,
+    4.2,
+  );
+}
+
 export function spawnIntervalForWave(wave: number, qaMode = false) {
   if (qaMode) return 0.72;
   return clamp(2.15 - Math.max(0, wave - 1) * 0.24, 0.82, 2.15);
