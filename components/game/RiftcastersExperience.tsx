@@ -26,6 +26,15 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { Button } from '@/components/ui/button';
+import { CommandCenter, Loadout } from './CommandCenter';
+import { OfflineStatus } from './OfflineStatus';
+import { ACHIEVEMENTS, defaultCareer } from '@/lib/game/career';
+import {
+  RIFTS_PER_CYCLE,
+  RIFT_CHAPTERS,
+  characterById,
+  isBossWave,
+} from '@/lib/game/content';
 import { affinityUnlockCost, recalibrationCost } from '@/lib/game/progression';
 import type { RiftEngine as RiftEngineType } from '@/lib/game/RiftEngine';
 import type {
@@ -37,6 +46,23 @@ import type {
 } from '@/lib/game/types';
 
 const EMPTY_HUD: HudSnapshot = {
+  character: 'kaela',
+  mode: 'expedition',
+  difficulty: 'standard',
+  career: defaultCareer(),
+  cycle: 1,
+  level: 1,
+  experience: 0,
+  nextLevelExperience: 45,
+  mana: 100,
+  maxMana: 100,
+  kills: 0,
+  bossPhase: 0,
+  upgradeReason: 'rift',
+  newAchievements: [],
+  qaMode: false,
+  checkpointCycle: null,
+  storageConflict: false,
   health: 100,
   maxHealth: 100,
   shield: 0,
@@ -147,6 +173,8 @@ export function RiftcastersExperience() {
   const [ready, setReady] = useState(false);
   const [webglError, setWebglError] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [journalOpen, setJournalOpen] = useState(false);
+  const [engineApi, setEngineApi] = useState<RiftEngineType | null>(null);
   const [stickPosition, setStickPosition] = useState({ x: 0, y: 0 });
   const [webMcpEpoch, setWebMcpEpoch] = useState(0);
 
@@ -175,6 +203,7 @@ export function RiftcastersExperience() {
         queueMicrotask(() => {
           if (!disposed) {
             setMuted(engine?.getMuted() ?? false);
+            setEngineApi(engine);
             setReady(true);
           }
         });
@@ -443,7 +472,7 @@ export function RiftcastersExperience() {
 
   return (
     <main
-      className="rift-game"
+      className={`rift-game${hud.career.settings.contrast ? ' high-contrast' : ''}${hud.career.settings.reducedMotion ? ' reduced-motion' : ''}`}
       data-testid="riftcasters-game"
       data-game-state={phase}
       data-game-ready={ready}
@@ -457,13 +486,23 @@ export function RiftcastersExperience() {
       />
       <div className="scanlines" aria-hidden="true" />
       <div className="vignette" aria-hidden="true" />
+      <OfflineStatus phase={phase} />
+      {hud.storageConflict && (
+        <div className="storage-conflict" role="alert">
+          Un autre onglet a modifié la sauvegarde. Les écritures sont
+          suspendues. Exporte cette session dans le journal, puis recharge pour
+          retrouver la progression la plus récente.
+        </div>
+      )}
 
       <header className="game-brand">
         <span className="brand-mark">
           <Sparkles size={15} />
         </span>
         <span>RIFTCASTERS</span>
-        <small>{'// ARCHIVE 07'}</small>
+        <small>
+          {hud.qaMode ? '// TEST — SANS SAUVEGARDE' : '// CONVERGENCE'}
+        </small>
       </header>
 
       {phase !== 'paused' && phase !== 'upgrade' && !archiveOpen && (
@@ -496,73 +535,106 @@ export function RiftcastersExperience() {
       )}
 
       {phase === 'menu' && !archiveOpen && (
-        <section className="start-panel" aria-labelledby="game-title">
-          <div className="eyebrow">
-            <span /> TRANSMISSION INSTABLE
-          </div>
-          <h1 id="game-title">
-            RIFT
-            <br />
-            <em>CASTERS</em>
-          </h1>
-          <p className="game-premise">
-            Trois failles rongent l&apos;Arche. Entre dans l&apos;arène,
-            canalise leurs gardiens et empêche le Néant de traverser. Élimine
-            les contestataires avant que sa pression atteigne 100&nbsp;%.
-          </p>
-          <Button
-            className="play-button"
-            size="lg"
-            type="button"
-            data-testid="start-game"
-            disabled={!ready || webglError}
-            onClick={start}
-          >
-            <Play fill="currentColor" /> ENTRER DANS LA FAILLE
-          </Button>
-          <div className="menu-meta">
-            <span>
-              <Move /> ZQSD / WASD
-            </span>
-            <span>
-              <Crosshair /> SOURIS POUR VISER
-            </span>
-            <span>
-              <Wind /> ESPACE POUR ESQUIVER
-            </span>
-          </div>
-          <div className="legacy-stats" aria-label="Progression sauvegardée">
-            <span>
-              MEILLEUR SCORE <strong>{formatScore(hud.highScore)}</strong>
-            </span>
-            <span>
-              POUSSIÈRE D&apos;ÉTHER <strong>{hud.dust}</strong>
-            </span>
-            <span>
-              TRANSMISSIONS <strong>{hud.runsCompleted}</strong>
-            </span>
-            <span>
-              VICTOIRES <strong>{hud.victories}</strong>
-            </span>
-            <span>
-              AFFINITÉ <strong>{AFFINITY_LABELS[hud.affinity]}</strong>
-            </span>
-          </div>
-          <Button
-            variant="ghost"
-            className="archive-trigger"
-            data-archive-trigger
-            type="button"
-            onClick={() => setArchiveOpen(true)}
-          >
-            <Gem /> OUVRIR L&apos;ARCHIVE DE L&apos;ARCHE
-          </Button>
-          {!hud.storageAvailable && (
-            <output className="storage-warning">
-              Sauvegarde indisponible : progression limitée à cette session.
-            </output>
-          )}
-        </section>
+        <div className="menu-layout">
+          <section className="start-panel" aria-labelledby="game-title">
+            <div className="eyebrow">
+              <span /> TRANSMISSION INSTABLE
+            </div>
+            <h1 id="game-title">
+              RIFT
+              <br />
+              <em>CASTERS</em>
+            </h1>
+            <p className="game-premise">
+              Cinq failles rongent l&apos;Arche. Entre dans l&apos;arène,
+              maintiens E dans leurs cercles et empêche le Néant de traverser.
+              Élimine les contestataires avant que sa pression atteigne
+              100&nbsp;%.
+            </p>
+            <Button
+              className="play-button"
+              size="lg"
+              type="button"
+              data-testid="start-game"
+              disabled={!ready || webglError}
+              onClick={start}
+            >
+              <Play fill="currentColor" />{' '}
+              {hud.checkpointCycle
+                ? `REPRENDRE — CYCLE ${hud.checkpointCycle}`
+                : 'ENTRER DANS LA FAILLE'}
+            </Button>
+            <div className="menu-meta">
+              <span>
+                <Move /> ZQSD / WASD
+              </span>
+              <span>
+                <Crosshair /> SOURIS POUR VISER
+              </span>
+              <span>
+                <Wind /> ESPACE POUR ESQUIVER
+              </span>
+            </div>
+            <div className="legacy-stats" aria-label="Progression sauvegardée">
+              <span>
+                MEILLEUR SCORE <strong>{formatScore(hud.highScore)}</strong>
+              </span>
+              <span>
+                POUSSIÈRE D&apos;ÉTHER <strong>{hud.dust}</strong>
+              </span>
+              <span>
+                TRANSMISSIONS <strong>{hud.runsCompleted}</strong>
+              </span>
+              <span>
+                VICTOIRES <strong>{hud.victories}</strong>
+              </span>
+              <span>
+                AFFINITÉ <strong>{AFFINITY_LABELS[hud.affinity]}</strong>
+              </span>
+            </div>
+            <Button
+              variant="ghost"
+              className="archive-trigger"
+              data-archive-trigger
+              type="button"
+              onClick={() => setArchiveOpen(true)}
+            >
+              <Gem /> OUVRIR L&apos;ARCHIVE DE L&apos;ARCHE
+            </Button>
+            <Button
+              variant="ghost"
+              className="archive-trigger"
+              data-journal-trigger
+              onClick={() => setJournalOpen(true)}
+            >
+              GUIDE · PARAMÈTRES · SUCCÈS
+            </Button>
+            {!hud.storageAvailable && (
+              <output className="storage-warning">
+                Sauvegarde indisponible : progression limitée à cette session.
+              </output>
+            )}
+          </section>
+          <Loadout
+            hud={hud}
+            configure={(character, mode, difficulty) =>
+              engineRef.current?.configureRun(character, mode, difficulty)
+            }
+          />
+        </div>
+      )}
+      {journalOpen && (
+        <CommandCenter
+          hud={hud}
+          engine={engineApi}
+          initialSection={
+            phase === 'victory' || phase === 'gameover' ? 'career' : 'guide'
+          }
+          close={() => {
+            setJournalOpen(false);
+            setMuted(engineRef.current?.getMuted() ?? false);
+          }}
+        />
       )}
 
       {phase === 'menu' && archiveOpen && (
@@ -675,20 +747,22 @@ export function RiftcastersExperience() {
           <section className="objective-card">
             <span>
               {hud.bossHealth === null
-                ? `OBJECTIF // 0${Math.min(3, hud.wave)}`
-                : 'MENACE // TITAN'}
+                ? `FAILLE ${Math.min(RIFTS_PER_CYCLE, hud.wave)}/${RIFTS_PER_CYCLE} // ${RIFT_CHAPTERS[Math.min(4, hud.wave - 1)].name}`
+                : `TYRAN // PHASE ${hud.bossPhase}`}
             </span>
             <strong>
               {hud.bossHealth === null
-                ? 'STABILISER LA FAILLE'
-                : 'BRISER LE CŒUR DU TITAN'}
+                ? hud.career.settings.autoChannel
+                  ? 'RESTER DANS LE CERCLE'
+                  : 'MAINTENIR E DANS LE CERCLE'
+                : 'BRISER LA CONVERGENCE'}
             </strong>
             <progress
               className="rift-progress"
               aria-label={
                 hud.bossHealth === null
                   ? 'Stabilisation de la faille'
-                  : 'Intégrité du Titan'
+                  : 'Intégrité du Tyran'
               }
               max={100}
               value={Math.round(hud.bossHealth ?? hud.riftProgress)}
@@ -712,6 +786,16 @@ export function RiftcastersExperience() {
             <span>SCORE</span>
             <strong>{formatScore(hud.score)}</strong>
             <small>{formatTime(hud.elapsed)}</small>
+            <small>
+              {characterById(hud.character).name} · C{hud.cycle} · Niv.{' '}
+              {hud.level}
+            </small>
+            <progress
+              className="xp-track"
+              aria-label="Expérience du niveau"
+              max={hud.nextLevelExperience}
+              value={hud.experience}
+            />
           </section>
 
           <section className="hud-vitals" data-testid="hud-health">
@@ -731,6 +815,18 @@ export function RiftcastersExperience() {
               max={Math.round(hud.maxShield)}
               value={Math.round(hud.shield)}
             />
+            <div className="mana-label">
+              MANA{' '}
+              <strong>
+                {Math.floor(hud.mana)} / {hud.maxMana}
+              </strong>
+            </div>
+            <progress
+              className="mana-track"
+              aria-label="Mana"
+              max={hud.maxMana}
+              value={hud.mana}
+            />
           </section>
 
           <section className="combat-readout">
@@ -746,10 +842,11 @@ export function RiftcastersExperience() {
 
           <section className="spell-deck" aria-label="Sorts disponibles">
             <AbilityButton
-              label="PUITS"
-              keyLabel="CLIC D."
+              label={characterById(hud.character).secondary}
+              keyLabel="2 / CLIC D."
               icon={<Orbit />}
               cooldown={hud.gravityCooldown}
+              resourceReady={hud.mana >= 30}
               onClick={() => cast('gravity')}
             />
             <AbilityButton
@@ -761,13 +858,14 @@ export function RiftcastersExperience() {
             />
             <AbilityButton
               label="ÉGIDE"
-              keyLabel="E"
+              keyLabel="F"
               icon={<Shield />}
               cooldown={hud.shieldCooldown}
+              resourceReady={hud.mana >= 20}
               onClick={() => cast('shield')}
             />
             <AbilityButton
-              label="BRISURE"
+              label={characterById(hud.character).ultimate}
               keyLabel="R"
               icon={<Zap />}
               meter={hud.ultimate}
@@ -786,6 +884,23 @@ export function RiftcastersExperience() {
 
       {phase === 'playing' && (
         <div className="touch-controls" aria-label="Contrôles tactiles">
+          {!isBossWave(hud.wave) && (
+            <button
+              className="touch-channel"
+              type="button"
+              aria-label="Maintenir pour canaliser la faille"
+              onPointerDown={(event) => {
+                event.currentTarget.setPointerCapture(event.pointerId);
+                engineRef.current?.setChannel(true);
+              }}
+              onPointerUp={() => engineRef.current?.setChannel(false)}
+              onPointerCancel={() => engineRef.current?.setChannel(false)}
+            >
+              MAINTENIR
+              <br />
+              CANALISER
+            </button>
+          )}
           <div
             ref={stickRef}
             className="touch-stick"
@@ -829,8 +944,15 @@ export function RiftcastersExperience() {
           <Button className="play-button" size="lg" onClick={togglePause}>
             <Play fill="currentColor" /> REPRENDRE
           </Button>
-          <button className="text-action" type="button" onClick={start}>
-            <RotateCcw /> RECOMMENCER LA TRANSMISSION
+          <Button variant="ghost" onClick={() => setJournalOpen(true)}>
+            GUIDE ET PARAMÈTRES
+          </Button>
+          <button
+            className="text-action"
+            type="button"
+            onClick={() => engineRef.current?.abandonRun()}
+          >
+            TERMINER LA TRANSMISSION ET VOIR LE BILAN
           </button>
         </OverlayPanel>
       )}
@@ -844,7 +966,11 @@ export function RiftcastersExperience() {
           aria-labelledby="upgrade-title"
         >
           <div className="upgrade-heading">
-            <span>FAILLE STABILISÉE</span>
+            <span>
+              {hud.upgradeReason === 'level'
+                ? `NIVEAU ${hud.level} ATTEINT`
+                : 'FAILLE STABILISÉE'}
+            </span>
             <h2 id="upgrade-title">CHOISIS UNE RÉSONANCE</h2>
             <p>
               Elle façonnera le reste de cette transmission. Affinité&nbsp;:{' '}
@@ -916,7 +1042,11 @@ export function RiftcastersExperience() {
               DURÉE <strong>{formatTime(hud.elapsed)}</strong>
             </span>
             <span>
-              FAILLES <strong>{hud.riftsStabilized}/3</strong>
+              FAILLES{' '}
+              <strong>
+                {hud.riftsStabilized}
+                {hud.mode === 'expedition' ? `/${RIFTS_PER_CYCLE}` : ''}
+              </strong>
             </span>
           </div>
           {hud.build.length > 0 && (
@@ -935,6 +1065,34 @@ export function RiftcastersExperience() {
             </div>
           )}
           <p>{hud.message}</p>
+          {!hud.storageAvailable && (
+            <p className="storage-warning">
+              RÉSULTAT NON ENREGISTRÉ. Ne ferme pas cette page avant d’avoir
+              exporté la progression. L’extraction ne répare pas un stockage
+              bloqué.
+            </p>
+          )}
+          <Button variant="ghost" onClick={() => setJournalOpen(true)}>
+            CARRIÈRE · SAUVEGARDE · EXPORT
+          </Button>
+          {!hud.storageAvailable && !hud.storageConflict && (
+            <Button
+              variant="ghost"
+              onClick={() => engineRef.current?.retrySave()}
+            >
+              RÉESSAYER LA SAUVEGARDE
+            </Button>
+          )}
+          {hud.newAchievements.length > 0 && (
+            <p className="unlocked-notice">
+              SUCCÈS :{' '}
+              {hud.newAchievements
+                .map(
+                  (id) => ACHIEVEMENTS.find((entry) => entry.id === id)?.title,
+                )
+                .join(' · ')}
+            </p>
+          )}
           <Button className="play-button" size="lg" onClick={start}>
             <RotateCcw /> NOUVELLE TRANSMISSION
           </Button>
@@ -945,6 +1103,40 @@ export function RiftcastersExperience() {
           >
             <Gem /> RETOUR À L&apos;ARCHE
           </button>
+        </OverlayPanel>
+      )}
+
+      {phase === 'camp' && (
+        <OverlayPanel
+          eyebrow={`ENDURANCE // CYCLE ${hud.cycle} TERMINÉ`}
+          title="UN INSTANT DE RÉPIT"
+          victory
+        >
+          <p>
+            Le Tyran est tombé. Extrais-toi pour enregistrer la victoire ou
+            continue avec ton build et toutes tes ressources restaurées.{' '}
+            {hud.qaMode
+              ? 'Mode test : aucun point de reprise écrit.'
+              : hud.storageAvailable
+                ? 'Point de reprise enregistré ici : tu peux fermer puis reprendre au camp.'
+                : 'Stockage indisponible : extrais-toi puis exporte la progression depuis le bilan avant de fermer.'}
+          </p>
+          <p>
+            {formatScore(hud.score)} points · {hud.kills} anomalies · Niveau{' '}
+            {hud.level}
+          </p>
+          <Button
+            className="play-button"
+            onClick={() => engineRef.current?.continueEndurance()}
+          >
+            CONTINUER — CYCLE {hud.cycle + 1}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => engineRef.current?.extractRun()}
+          >
+            EXTRAIRE ET ENREGISTRER LA VICTOIRE
+          </Button>
         </OverlayPanel>
       )}
 
@@ -965,6 +1157,7 @@ function AbilityButton({
   cooldown = 0,
   charges,
   meter,
+  resourceReady = true,
   onClick,
 }: {
   label: string;
@@ -973,9 +1166,14 @@ function AbilityButton({
   cooldown?: number;
   charges?: number;
   meter?: number;
+  resourceReady?: boolean;
   onClick: () => void;
 }) {
-  const disabled = cooldown > 0 || (charges !== undefined && charges <= 0);
+  const disabled =
+    !resourceReady ||
+    cooldown > 0 ||
+    (charges !== undefined && charges <= 0) ||
+    (meter !== undefined && meter < 100);
   return (
     <Button
       variant="ghost"

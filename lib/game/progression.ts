@@ -1,4 +1,6 @@
 import type { Affinity, AffinityId, AffinityUnlocks } from './types';
+import { defaultCareer, sanitizeCareer, type Career } from './career';
+import { sanitizeCheckpoint, type RunCheckpoint } from './checkpoint';
 
 export const PROGRESSION_STORAGE_KEY = 'riftcasters-save-v2';
 export const LEGACY_STORAGE_KEY = 'riftcasters-save-v1';
@@ -12,6 +14,8 @@ export type ProgressionProfile = {
   victories: number;
   unlockedAffinities: AffinityUnlocks;
   equippedAffinity: Affinity;
+  career: Career;
+  checkpoint: RunCheckpoint | null;
 };
 
 const AFFINITY_COSTS: Record<AffinityId, number> = {
@@ -34,6 +38,8 @@ export function createDefaultProfile(): ProgressionProfile {
       neant: false,
     },
     equippedAffinity: 'none',
+    career: defaultCareer(),
+    checkpoint: null,
   };
 }
 
@@ -103,6 +109,8 @@ function parseCandidate(
       ),
       unlockedAffinities,
       equippedAffinity,
+      career: sanitizeCareer(parsed.career),
+      checkpoint: sanitizeCheckpoint(parsed.checkpoint),
     };
   } catch {
     return null;

@@ -11,7 +11,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,3 +26,20 @@ jobs:
         run: npm run qa
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+      - name: Playable, offline and standalone paths
+        run: npm run test:e2e
+      - name: Verified playable distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: RIFTCASTERS-playable-${{ github.sha }}
+          path: dist/release/
+      - name: Browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-diagnostics
+          path: |
+            outputs/test-results/
+            outputs/playwright-report/

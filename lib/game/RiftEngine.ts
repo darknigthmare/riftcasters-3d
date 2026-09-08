@@ -33,6 +33,35 @@ import type {
   UpgradeId,
 } from './types';
 import { RiftAudio } from './RiftAudio';
+import {
+  CHARACTERS,
+  DIFFICULTIES,
+  EXTRA_UPGRADES,
+  RIFT_CHAPTERS,
+  bossPhaseAt,
+  characterById,
+  experienceForLevel,
+  isBossWave,
+  type CharacterId,
+  type Difficulty,
+  type RunMode,
+} from './content';
+import {
+  awardAchievements,
+  defaultCareer,
+  sanitizeCareer,
+  type GameSettings,
+} from './career';
+import { sanitizeCheckpoint, type RunCheckpoint } from './checkpoint';
+
+declare global {
+  interface Window {
+    __riftTest?: {
+      state: () => unknown;
+      command: (command: string, value?: number) => void;
+    };
+  }
+}
 
 type Callbacks = {
   onHud: (snapshot: HudSnapshot) => void;
@@ -41,6 +70,15 @@ type Callbacks = {
 };
 
 type Enemy = {
+  elite: boolean;
+  bossPhase: number;
+  burn: number;
+  burnPower: number;
+  slow: number;
+  freeze: number;
+  marks: number;
+  charge: number;
+  chargeDirection: THREE.Vector3;
   id: number;
   kind: EnemyKind;
   group: THREE.Group;
@@ -68,7 +106,7 @@ type Projectile = {
 };
 
 type AreaEffect = {
-  kind: 'gravity' | 'blast' | 'danger';
+  kind: 'gravity' | 'flame' | 'stasis' | 'blast' | 'danger';
   mesh: THREE.Mesh;
   life: number;
   duration: number;
@@ -98,6 +136,7 @@ type Stats = {
 };
 
 const UPGRADE_LIBRARY: UpgradeChoice[] = [
+  ...EXTRA_UPGRADES,
   {
     id: 'forked-bolt',
     school: 'BRAISE',
@@ -161,6 +200,8 @@ const ENEMY_COLORS: Record<EnemyKind, [number, number]> = {
   spectre: [0x60d8ff, 0x194a87],
   guardian: [0xffbd5c, 0x6f3f16],
   leech: [0x9bff83, 0x286942],
+  artillery: [0xff784e, 0x6a2210],
+  ravager: [0xf4df8b, 0x70601e],
   boss: [0xf05bff, 0x5f0a7c],
 };
 
@@ -246,7 +287,29 @@ export class RiftEngine {
   private rerollsThisRun = 0;
   private lastRerollAt = -Infinity;
   private gamepadButtons = new Map<number, boolean>();
+  private gamepadNeedsRelease = false;
   private stats: Stats = this.defaultStats();
+  private career = defaultCareer();
+  private checkpoint: RunCheckpoint | null = null;
+  private lastSavedRaw: string | null = null;
+  private storageConflict = false;
+  private cycle = 1;
+  private completedCycles = 0;
+  private level = 1;
+  private experience = 0;
+  private pendingLevels = 0;
+  private upgradeReason: 'rift' | 'level' = 'rift';
+  private mana = 100;
+  private kills = 0;
+  private runUltimates = 0;
+  private bestCombo = 0;
+  private newAchievements: string[] = [];
+  private touchChannel = false;
+  private pickups: Array<{
+    mesh: THREE.Mesh;
+    kind: 'health' | 'mana' | 'essence';
+    life: number;
+  }> = [];
 
   constructor(canvas: HTMLCanvasElement, callbacks: Callbacks) {
     this.canvas = canvas;
@@ -278,12 +341,101 @@ export class RiftEngine {
     this.camera.lookAt(0, 0, 0);
 
     this.buildWorld();
+    this.applySettings();
     this.resizeObserver = new ResizeObserver(this.resize);
     this.resizeObserver.observe(canvas);
     this.resize();
     this.bindEvents();
     this.loop();
     this.pushHud(true);
+    if (this.qaMode)
+      window.__riftTest = {
+        state: () => ({
+          phase: this.phase,
+          wave: this.wave,
+          cycle: this.cycle,
+          level: this.level,
+          experience: this.experience,
+          mana: this.mana,
+          health: this.health,
+          rifts: this.riftsStabilized,
+          kills: this.kills,
+          player: this.player.position.toArray(),
+          target: this.riftTarget.toArray(),
+          enemies: this.enemies.map((enemy) => ({
+            kind: enemy.kind,
+            hp: enemy.hp,
+            phase: enemy.bossPhase,
+            burn: enemy.burn,
+            burnPower: enemy.burnPower,
+            freeze: enemy.freeze,
+            marks: enemy.marks,
+            slow: enemy.slow,
+            elite: enemy.elite,
+          })),
+          upgrades: [...this.upgradeRanks],
+          choices: this.currentUpgradeChoices.map((entry) => entry.id),
+          reason: this.upgradeReason,
+          gpu: this.renderer.info.memory,
+          calls: this.renderer.info.render.calls,
+        }),
+        command: (command, value = 1) => {
+          if (!this.qaMode) return;
+          if (command === 'step')
+            for (let i = 0; i < Math.min(3000, Math.max(0, value)); i += 1) {
+              if (this.phase === 'playing') this.updateGame(1 / 60);
+            }
+          if (
+            command === 'rift' &&
+            this.phase === 'playing' &&
+            !isBossWave(this.wave)
+          ) {
+            this.player.position.copy(this.riftTarget);
+            this.riftProgress = 99.99;
+            this.updateWave(0.04);
+          }
+          if (command === 'xp' && this.phase === 'playing') {
+            this.gainExperience(Math.max(0, Math.min(5000, value)));
+            this.updateGame(0);
+          }
+          if (command === 'damage') this.damagePlayer(Math.max(0, value));
+          if (command === 'boss-health') {
+            const boss = this.enemies.find((entry) => entry.kind === 'boss');
+            if (boss) {
+              boss.hp = boss.maxHp * clamp(value, 0.01, 1);
+              this.updateEnemies(0);
+            }
+          }
+          if (command === 'kill-boss') {
+            const boss = this.enemies.find((entry) => entry.kind === 'boss');
+            if (boss)
+              this.damageEnemy(boss, boss.maxHp * 2, boss.group.position);
+          }
+          if (command === 'max-build')
+            UPGRADE_LIBRARY.forEach((entry) =>
+              this.upgradeRanks.set(entry.id, 3),
+            );
+          if (command === 'ultimate') this.ultimate = 100;
+          if (command === 'effect-fixture' && this.phase === 'playing') {
+            this.clearEntities();
+            // Keep capture out of range so effect-duration tests cannot pause at a reward screen.
+            this.riftTarget.set(0, 0, -9);
+            this.player.position.set(0, 0, 0);
+            this.aimPoint.set(1, 0, 0);
+            this.spawnTimer = 3600;
+            this.invulnerable = 60;
+            this.spawnEnemy('guardian', new THREE.Vector3(1, 0, 0));
+            this.spawnEnemy('guardian', new THREE.Vector3(2, 0, 0));
+            this.enemies.forEach((enemy) => {
+              enemy.hp = enemy.maxHp = 10000;
+              enemy.speed = 0;
+            });
+          }
+          if (command === 'elemental-impact' && this.enemies[0])
+            this.applyElementalImpact(this.enemies[0], 100);
+          this.pushHud(true);
+        },
+      };
   }
 
   private defaultStats(): Stats {
@@ -484,10 +636,261 @@ export class RiftEngine {
 
   start() {
     void this.audio.unlock();
+    if (this.phase === 'menu' && this.checkpoint) {
+      this.resumeCheckpoint();
+      return;
+    }
     this.resetRun();
     this.setPhase('playing');
-    this.showMessage('CANALISE LA FAILLE', 2.2);
+    this.showMessage(
+      `${RIFT_CHAPTERS[0].name.toUpperCase()} // MAINTIENS E DANS LE CERCLE`,
+      4,
+    );
   }
+
+  configureRun(character: CharacterId, mode: RunMode, difficulty: Difficulty) {
+    if (this.phase !== 'menu' || this.checkpoint) return;
+    this.career = sanitizeCareer({
+      ...this.career,
+      character,
+      mode,
+      difficulty,
+    });
+    this.saveProgress();
+    this.applyCharacter();
+    this.pushHud(true);
+  }
+
+  updateSettings(settings: Partial<GameSettings>) {
+    this.career = sanitizeCareer({
+      ...this.career,
+      settings: { ...this.career.settings, ...settings },
+    });
+    this.applySettings();
+    this.saveProgress();
+    this.pushHud(true);
+  }
+
+  private applySettings() {
+    this.reducedMotion =
+      this.career.settings.reducedMotion ||
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    this.renderer.setPixelRatio(
+      Math.min(
+        window.devicePixelRatio || 1,
+        { low: 1, balanced: 1.5, high: 2 }[this.career.settings.quality],
+      ),
+    );
+    this.audio.setVolume(this.career.settings.volume);
+    this.applyCharacter();
+  }
+
+  private applyCharacter() {
+    const caster = characterById(this.career.character);
+    if (this.playerFocus)
+      (this.playerFocus.material as THREE.MeshStandardMaterial).emissive.setHex(
+        caster.hex,
+      );
+    if (this.playerRing)
+      (this.playerRing.material as THREE.MeshBasicMaterial).color.setHex(
+        caster.hex,
+      );
+  }
+
+  private rank(id: UpgradeId) {
+    return this.upgradeRanks.get(id) ?? 0;
+  }
+  private get maxMana() {
+    return 100 + 25 * this.rank('mana-flow');
+  }
+  private get threat() {
+    return Math.min(5, 1 + (this.cycle - 1) * 0.35);
+  }
+
+  setChannel(active: boolean) {
+    this.touchChannel = active;
+  }
+
+  continueEndurance() {
+    if (this.phase !== 'camp') return;
+    this.clearEntities();
+    this.cycle += 1;
+    this.wave = 1;
+    this.bossSpawned = false;
+    this.riftProgress = 0;
+    this.voidPressure = 0;
+    this.health = this.stats.maxHealth;
+    this.mana = this.maxMana;
+    this.shield = 0;
+    this.ultimate = 100;
+    this.dashCharges = 2;
+    this.dashRecharge = 0;
+    this.gravityCooldown = 0;
+    this.shieldCooldown = 0;
+    this.shieldTime = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.spawnTimer = 1.5;
+    this.invulnerable = 2;
+    this.moveRiftToWave();
+    this.setPhase('playing');
+    this.showMessage(`CYCLE ${this.cycle} // LA CONVERGENCE RECOMMENCE`, 3);
+  }
+
+  extractRun() {
+    if (this.phase !== 'camp') return;
+    this.setPhase('playing');
+    this.finishRun(true);
+  }
+
+  private resumeCheckpoint() {
+    const saved = this.checkpoint;
+    if (!saved) return;
+    this.career.character = saved.character;
+    this.career.difficulty = saved.difficulty;
+    this.career.mode = 'endless';
+    this.resetRun();
+    for (const [id, rank] of Object.entries(saved.ranks))
+      this.upgradeRanks.set(id as UpgradeId, rank);
+    const rank = (id: UpgradeId) => this.rank(id);
+    const caster = characterById(saved.character);
+    this.stats = {
+      boltDamage: caster.damage * 1.32 ** rank('arcane-force'),
+      boltCount: Math.min(5, 1 + rank('forked-bolt')),
+      fireRate: Math.max(0.12, 0.24 * 0.91 ** rank('arcane-force')),
+      pierce: rank('piercing-light'),
+      maxHealth: caster.health + 30 * rank('vital-surge'),
+      shieldPower: 38 + 18 * rank('prism-ward'),
+      gravityPower: 1 + 0.34 * rank('void-well'),
+      gravityCooldownScale: 0.86 ** rank('void-well'),
+      dashLevel: rank('rift-step'),
+      dashBlast: 18 * rank('rift-step') + 34 * rank('echo-burst'),
+    };
+    this.health = this.stats.maxHealth;
+    this.mana = this.maxMana;
+    this.cycle = saved.cycle;
+    this.completedCycles = saved.cycle;
+    this.wave = 6;
+    this.score = saved.score;
+    this.riftsStabilized = saved.rifts;
+    this.level = saved.level;
+    this.experience = saved.experience;
+    this.pendingLevels = saved.pendingLevels;
+    this.kills = saved.kills;
+    this.runUltimates = saved.ultimates;
+    this.bestCombo = saved.bestCombo;
+    this.elapsed = saved.elapsed;
+    this.rerollsThisRun = saved.rerolls;
+    this.setPhase('camp');
+  }
+
+  private saveCheckpoint() {
+    if (this.qaMode) return;
+    this.checkpoint = {
+      version: 1,
+      character: this.career.character,
+      difficulty: this.career.difficulty,
+      cycle: this.cycle,
+      score: this.score,
+      rifts: this.riftsStabilized,
+      level: this.level,
+      experience: this.experience,
+      pendingLevels: this.pendingLevels,
+      kills: this.kills,
+      ultimates: this.runUltimates,
+      bestCombo: this.bestCombo,
+      elapsed: this.elapsed,
+      ranks: Object.fromEntries(this.upgradeRanks),
+      rerolls: this.rerollsThisRun,
+    };
+    this.saveProgress();
+  }
+
+  abandonRun() {
+    if (this.phase !== 'paused') return;
+    this.setPhase('playing');
+    this.finishRun(false);
+  }
+
+  exportSave() {
+    return JSON.stringify(
+      {
+        ...createDefaultProfile(),
+        highScore: this.highScore,
+        dust: this.dust,
+        muted: this.muted,
+        runsCompleted: this.runsCompleted,
+        victories: this.victories,
+        unlockedAffinities: this.unlockedAffinities,
+        equippedAffinity: this.affinity,
+        career: this.career,
+        checkpoint: this.checkpoint,
+      },
+      null,
+      2,
+    );
+  }
+
+  importSave(raw: string) {
+    if (
+      this.phase !== 'menu' ||
+      this.qaMode ||
+      this.storageConflict ||
+      raw.length > 100000 ||
+      !isValidCurrentProgression(raw)
+    )
+      return false;
+    try {
+      const requestedCheckpoint: unknown = (
+        JSON.parse(raw) as { checkpoint?: unknown }
+      ).checkpoint;
+      if (
+        requestedCheckpoint != null &&
+        !sanitizeCheckpoint(requestedCheckpoint)
+      )
+        return false;
+      if (
+        window.localStorage.getItem(PROGRESSION_STORAGE_KEY) !==
+        this.lastSavedRaw
+      ) {
+        this.markStorageConflict();
+        return false;
+      }
+      const clean = readProgression(raw, null);
+      window.localStorage.setItem('riftcasters-save-backup', this.exportSave());
+      window.localStorage.setItem(
+        PROGRESSION_STORAGE_KEY,
+        JSON.stringify(clean),
+      );
+      this.loadSave();
+      this.applySettings();
+      this.pushHud(true);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  retrySave() {
+    const success = this.saveProgress();
+    this.pushHud(true);
+    return success;
+  }
+
+  private markStorageConflict() {
+    this.storageConflict = true;
+    this.storageAvailable = false;
+    if (this.phase === 'playing') this.setPhase('paused');
+    this.pushHud(true);
+  }
+
+  private onStorage = (event: StorageEvent) => {
+    if (
+      (event.key === PROGRESSION_STORAGE_KEY || event.key === null) &&
+      event.newValue !== this.lastSavedRaw
+    )
+      this.markStorageConflict();
+  };
 
   returnToMenu() {
     if (this.phase !== 'gameover' && this.phase !== 'victory') return;
@@ -650,17 +1053,22 @@ export class RiftEngine {
       case 'echo-burst':
         this.stats.dashBlast += 34;
         break;
+      case 'mana-flow':
+        this.mana = this.maxMana;
+        break;
     }
     this.audio.play('upgrade');
-    this.wave += 1;
-    this.riftProgress = 0;
-    if (this.wave >= 4) this.voidPressure = 0;
+    if (this.upgradeReason === 'rift') {
+      this.wave += 1;
+      this.riftProgress = 0;
+      if (isBossWave(this.wave)) this.voidPressure = 0;
+      this.moveRiftToWave();
+    }
     this.spawnTimer = 0.35;
     for (const enemy of this.enemies) {
       enemy.attackTimer = Math.max(enemy.attackTimer, 0.9);
       enemy.shootTimer = Math.max(enemy.shootTimer, 1.1);
     }
-    this.moveRiftToWave();
     this.setPhase('playing');
     this.showMessage(`RÉSONANCE ${rank} // VAGUE ${this.wave}`, 2.4);
   }
@@ -701,6 +1109,7 @@ export class RiftEngine {
   }
 
   dispose() {
+    if (this.qaMode) delete window.__riftTest;
     cancelAnimationFrame(this.animationFrame);
     this.resizeObserver.disconnect();
     this.unbindEvents();
@@ -723,6 +1132,7 @@ export class RiftEngine {
   }
 
   private bindEvents() {
+    window.addEventListener('storage', this.onStorage);
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onWindowBlur);
@@ -734,6 +1144,7 @@ export class RiftEngine {
   }
 
   private unbindEvents() {
+    window.removeEventListener('storage', this.onStorage);
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onWindowBlur);
@@ -745,6 +1156,7 @@ export class RiftEngine {
   }
 
   private onKeyDown = (event: KeyboardEvent) => {
+    if (document.querySelector('dialog[data-system-dialog]')) return;
     const pauseKey = event.code === 'Escape' || event.code === 'KeyP';
     if (pauseKey && (this.phase === 'playing' || this.phase === 'paused')) {
       event.preventDefault();
@@ -771,7 +1183,8 @@ export class RiftEngine {
     this.keys.add(event.code);
     if (event.repeat) return;
     if (event.code === 'Space') this.triggerAbility('dash');
-    if (event.code === 'KeyE') this.triggerAbility('shield');
+    if (event.code === 'KeyF') this.triggerAbility('shield');
+    if (event.code === 'Digit2') this.triggerAbility('gravity');
     if (event.code === 'KeyR') this.triggerAbility('ultimate');
   };
 
@@ -783,11 +1196,12 @@ export class RiftEngine {
     this.keys.clear();
     this.mouseHeld = false;
     this.gamepadButtons.clear();
+    this.gamepadNeedsRelease = true;
     if (this.phase === 'playing') this.setPhase('paused');
   };
 
   private onVisibility = () => {
-    if (document.hidden && this.phase === 'playing') this.setPhase('paused');
+    if (document.hidden) this.onWindowBlur();
   };
 
   private onPointerMove = (event: PointerEvent) => {
@@ -830,9 +1244,19 @@ export class RiftEngine {
   }
 
   private updateGamepadActions() {
+    if (document.hidden || !document.hasFocus()) {
+      this.gamepadNeedsRelease = true;
+      this.gamepadButtons.clear();
+      return;
+    }
     const gamepad = this.getActiveGamepad();
     if (!gamepad) {
       this.gamepadButtons.clear();
+      return;
+    }
+    if (this.gamepadNeedsRelease) {
+      if (gamepad.buttons.every((button) => button.value <= 0.35))
+        this.gamepadNeedsRelease = false;
       return;
     }
     const justPressed = (buttonIndex: number) => {
@@ -848,6 +1272,107 @@ export class RiftEngine {
     const shieldPressed = justPressed(4);
     const gravityPressed = justPressed(6);
     const pausePressed = justPressed(9);
+    const previousPressed = justPressed(12);
+    const nextPressed = justPressed(13);
+    const leftPressed = justPressed(14);
+    const rightPressed = justPressed(15);
+    const systemDialog = document.querySelector<HTMLDialogElement>(
+      'dialog[data-system-dialog], .archive-overlay[open]',
+    );
+    if (systemDialog) {
+      const elements = Array.from(
+        systemDialog.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]',
+        ),
+      ).filter((element) => element.getClientRects().length > 0);
+      const current = elements.indexOf(document.activeElement as HTMLElement);
+      if (nextPressed || previousPressed) {
+        const target =
+          elements[
+            (current + (nextPressed ? 1 : -1) + elements.length) %
+              elements.length
+          ];
+        target?.focus();
+        target?.scrollIntoView({ block: 'nearest' });
+      }
+      if (confirmPressed && document.activeElement instanceof HTMLElement)
+        document.activeElement.click();
+      const focused = document.activeElement;
+      if (leftPressed || rightPressed) {
+        const direction = rightPressed ? 1 : -1;
+        if (focused instanceof HTMLSelectElement) {
+          focused.selectedIndex = Math.max(
+            0,
+            Math.min(
+              focused.options.length - 1,
+              focused.selectedIndex + direction,
+            ),
+          );
+          focused.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (
+          focused instanceof HTMLInputElement &&
+          focused.type === 'range'
+        ) {
+          const next = Math.max(
+            Number(focused.min || 0),
+            Math.min(
+              Number(focused.max || 100),
+              Number(focused.value) + direction * Number(focused.step || 1),
+            ),
+          );
+          // Use the native setter so React receives a real input value change.
+          Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            'value',
+          )?.set?.call(focused, String(next));
+          focused.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+      if (thirdChoicePressed)
+        systemDialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+      return;
+    }
+    if (this.phase === 'menu') {
+      if (leftPressed || rightPressed) {
+        const current = CHARACTERS.findIndex(
+          (entry) => entry.id === this.career.character,
+        );
+        this.configureRun(
+          CHARACTERS[(current + (rightPressed ? 1 : 3)) % 4].id,
+          this.career.mode,
+          this.career.difficulty,
+        );
+      }
+      if (nextPressed || previousPressed)
+        this.configureRun(
+          this.career.character,
+          this.career.mode === 'endless' ? 'expedition' : 'endless',
+          this.career.difficulty,
+        );
+      if (secondChoicePressed) {
+        const choices: Difficulty[] = ['discovery', 'standard', 'cataclysm'];
+        this.configureRun(
+          this.career.character,
+          this.career.mode,
+          choices[(choices.indexOf(this.career.difficulty) + 1) % 3],
+        );
+      }
+      if (ultimatePressed)
+        document
+          .querySelector<HTMLButtonElement>('[data-journal-trigger]')
+          ?.click();
+    }
+    if (this.phase === 'camp' && thirdChoicePressed) {
+      this.extractRun();
+      return;
+    }
+    if (
+      (this.phase === 'gameover' || this.phase === 'victory') &&
+      thirdChoicePressed
+    ) {
+      this.returnToMenu();
+      return;
+    }
 
     if (pausePressed && (this.phase === 'playing' || this.phase === 'paused')) {
       this.togglePause();
@@ -864,6 +1389,8 @@ export class RiftEngine {
         if (choice) this.chooseUpgrade(choice.id);
       } else if (this.phase === 'gameover' || this.phase === 'victory') {
         this.start();
+      } else if (this.phase === 'camp') {
+        this.continueEndurance();
       }
     }
     if (this.phase === 'upgrade' && secondChoicePressed) {
@@ -908,6 +1435,10 @@ export class RiftEngine {
     this.shieldCooldown = Math.max(0, this.shieldCooldown - delta);
     this.shieldTime = Math.max(0, this.shieldTime - delta);
     this.invulnerable = Math.max(0, this.invulnerable - delta);
+    this.mana = Math.min(
+      this.maxMana,
+      this.mana + delta * (7 + 1.5 * this.rank('mana-flow')),
+    );
     this.shieldMesh.visible = this.shieldTime > 0;
 
     if (this.dashCharges < 2) {
@@ -930,11 +1461,21 @@ export class RiftEngine {
     this.updateAreas(delta);
     if (this.phase !== 'playing') return;
     this.updateParticles(delta);
+    this.updatePickups(delta);
+    // Level offers are deferred to a frame boundary: damage loops never skip rifts.
+    if (this.phase === 'playing' && this.pendingLevels > 0) {
+      this.pendingLevels -= 1;
+      this.upgradeReason = 'level';
+      this.offerUpgradeChoices();
+      if (this.currentUpgradeChoices.length) this.setPhase('upgrade');
+      else this.grantMasteryReward();
+    }
     this.pushHud();
   }
 
   private updateAim() {
     if (
+      this.career.settings.autoAim ||
       this.touchAttack ||
       Math.abs(this.touchMove.x) + Math.abs(this.touchMove.y) > 0
     ) {
@@ -1004,7 +1545,9 @@ export class RiftEngine {
     }
 
     if (move.lengthSq() > 0) {
-      move.normalize().multiplyScalar(delta * 5.2);
+      move
+        .normalize()
+        .multiplyScalar(delta * characterById(this.career.character).speed);
       this.player.position.add(move);
       const radius = Math.hypot(this.player.position.x, this.player.position.z);
       if (radius > 9.35) {
@@ -1020,12 +1563,12 @@ export class RiftEngine {
   }
 
   private updateWave(delta: number) {
-    if (this.wave >= 4) {
+    if (isBossWave(this.wave)) {
       if (!this.bossSpawned) {
         this.bossSpawned = true;
         this.spawnEnemy('boss', new THREE.Vector3(0, 0, -5.5));
         this.spawnTimer = 4.5;
-        this.showMessage('TITAN DE LA FAILLE', 3);
+        this.showMessage('TYRAN DE LA CONVERGENCE // PHASE I', 3);
         this.audio.play('rift');
       } else {
         this.spawnTimer -= delta;
@@ -1050,14 +1593,20 @@ export class RiftEngine {
     }
 
     const channeling =
+      (this.qaMode ||
+        this.career.settings.autoChannel ||
+        this.keys.has('KeyE') ||
+        this.touchChannel ||
+        (this.getActiveGamepad()?.buttons[5]?.value ?? 0) > 0.35) &&
       distance2D(this.player.position, this.riftTarget) <
-      (this.qaMode ? 6.2 : 3.25);
+        (this.qaMode ? 6.2 : 3.25);
     const nearby = this.enemies.filter(
       (enemy) =>
         enemy.kind !== 'boss' &&
         distance2D(enemy.group.position, this.riftTarget) < 3.5,
     ).length;
-    const pressureScale = this.qaMode ? 0.2 : 1;
+    const pressureScale =
+      (this.qaMode ? 0.2 : 1) * DIFFICULTIES[this.career.difficulty].pressure;
     this.voidPressure = clamp(
       this.voidPressure +
         voidPressureRate({
@@ -1101,6 +1650,7 @@ export class RiftEngine {
   }
 
   private completeWave() {
+    this.upgradeReason = 'rift';
     this.riftsStabilized += 1;
     this.score += 750 * this.wave;
     this.ultimate = clamp(this.ultimate + 24, 0, 100);
@@ -1132,7 +1682,20 @@ export class RiftEngine {
     this.audio.play('rift');
     this.showMessage(`FAILLE ${this.wave} STABILISÉE`, 2.5);
     this.offerUpgradeChoices();
-    this.setPhase('upgrade');
+    if (this.currentUpgradeChoices.length) this.setPhase('upgrade');
+    else {
+      this.grantMasteryReward();
+      this.wave += 1;
+      this.riftProgress = 0;
+      this.moveRiftToWave();
+    }
+  }
+
+  private grantMasteryReward() {
+    this.health = Math.min(this.stats.maxHealth, this.health + 25);
+    this.mana = this.maxMana;
+    this.score += 500;
+    this.showMessage('MAÎTRISE COMPLÈTE // SOIN, MANA ET +500 SCORE', 2);
   }
 
   private offerUpgradeChoices(excludedIds = new Set<UpgradeId>()) {
@@ -1174,6 +1737,8 @@ export class RiftEngine {
 
   private rollEnemyKind(): EnemyKind {
     const roll = Math.random();
+    if (this.wave >= 5 && roll > 0.78) return 'ravager';
+    if (this.wave >= 4 && roll < 0.2) return 'artillery';
     if (this.wave >= 3 && roll > 0.84) return 'leech';
     if (this.wave >= 2 && roll > 0.64) return 'guardian';
     if (roll > 0.4) return 'spectre';
@@ -1181,6 +1746,7 @@ export class RiftEngine {
   }
 
   private spawnEnemy(kind: EnemyKind, requestedPosition?: THREE.Vector3) {
+    if (this.enemies.length >= 32) return;
     const group = new THREE.Group();
     const [bright, dark] = ENEMY_COLORS[kind];
     const material = new THREE.MeshStandardMaterial({
@@ -1238,6 +1804,21 @@ export class RiftEngine {
       rings.rotation.x = Math.PI / 2;
       group.add(rings);
       group.userData.halo = rings;
+    } else if (kind === 'artillery') {
+      body = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.22, 0.68, 0.9, 6),
+        material,
+      );
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.16, 0.22, 1.2, 8),
+        material.clone(),
+      );
+      barrel.rotation.x = Math.PI / 3;
+      barrel.position.set(0, 0.4, 0.3);
+      group.add(barrel);
+    } else if (kind === 'ravager') {
+      body = new THREE.Mesh(new THREE.ConeGeometry(0.72, 1.6, 4), material);
+      body.rotation.x = Math.PI / 2;
     } else {
       body = new THREE.Mesh(new THREE.IcosahedronGeometry(1.34, 1), material);
       body.scale.set(0.9, 1.3, 0.9);
@@ -1297,15 +1878,44 @@ export class RiftEngine {
     group.position.y = kind === 'boss' ? 1.45 : 0.56;
     this.enemyRoot.add(group);
 
-    const waveScale = 1 + Math.max(0, this.wave - 1) * 0.22;
+    const elite =
+      kind !== 'boss' &&
+      this.wave >= 3 &&
+      Math.random() < Math.min(0.3, 0.12 + (this.cycle - 1) * 0.03);
+    if (elite) {
+      group.scale.setScalar(1.25);
+      const crest = new THREE.Mesh(
+        new THREE.TorusGeometry(0.8, 0.09, 6, 20),
+        new THREE.MeshBasicMaterial({ color: 0xffffff }),
+      );
+      crest.rotation.x = Math.PI / 2;
+      crest.position.y = 0.85;
+      group.add(crest);
+    }
+    const waveScale =
+      (1 + Math.max(0, this.wave - 1) * 0.16) *
+      this.threat *
+      DIFFICULTIES[this.career.difficulty].health *
+      (elite ? 1.8 : 1);
     const baseHealth = {
       stalker: 52,
       spectre: 62,
       guardian: 125,
       leech: 88,
-      boss: this.qaMode ? 360 : 1450,
+      artillery: 95,
+      ravager: 110,
+      boss: this.qaMode ? 360 : 1600,
     }[kind];
     const enemy: Enemy = {
+      elite,
+      bossPhase: 1,
+      burn: 0,
+      burnPower: 0,
+      slow: 0,
+      freeze: 0,
+      marks: 0,
+      charge: 0,
+      chargeDirection: new THREE.Vector3(),
       id: this.nextEnemyId,
       kind,
       group,
@@ -1316,6 +1926,8 @@ export class RiftEngine {
         spectre: 1.35,
         guardian: 1.12,
         leech: 1.65,
+        artillery: 0.8,
+        ravager: 1.5,
         boss: 0.82,
       }[kind],
       radius: kind === 'boss' ? 1.35 : kind === 'guardian' ? 0.72 : 0.55,
@@ -1324,6 +1936,8 @@ export class RiftEngine {
         spectre: 9,
         guardian: 18,
         leech: 8,
+        artillery: 16,
+        ravager: 22,
         boss: 24,
       }[kind],
       attackTimer: 0.6 + Math.random(),
@@ -1340,10 +1954,28 @@ export class RiftEngine {
     const playerPosition = this.player.position;
     for (const enemy of this.enemies.slice()) {
       if (this.phase !== 'playing') break;
+      if (enemy.freeze > 0 && enemy.kind !== 'boss') {
+        enemy.freeze = Math.max(0, enemy.freeze - delta);
+        continue;
+      }
       enemy.attackTimer -= delta;
       enemy.shootTimer -= delta;
       enemy.healTimer -= delta;
       enemy.flashTimer = Math.max(0, enemy.flashTimer - delta);
+      enemy.slow = Math.max(0, enemy.slow - delta);
+      if (enemy.burn > 0) {
+        enemy.burn = Math.max(0, enemy.burn - delta);
+        this.damageEnemy(
+          enemy,
+          enemy.burnPower * delta,
+          enemy.group.position,
+          true,
+        );
+        if (enemy.burn === 0) enemy.burnPower = 0;
+        if (!this.enemies.includes(enemy)) continue;
+      }
+      const step =
+        delta * (enemy.slow > 0 ? (enemy.kind === 'boss' ? 0.7 : 0.35) : 1);
       const body = enemy.group.getObjectByName('body') as THREE.Mesh;
       const material = body.material as THREE.MeshStandardMaterial;
       material.emissiveIntensity =
@@ -1365,17 +1997,67 @@ export class RiftEngine {
         playerPosition.z,
       );
 
-      if (enemy.kind === 'spectre') {
-        if (distance > 5.6) {
-          enemy.group.position.addScaledVector(direction, enemy.speed * delta);
-        } else if (distance < 3.6) {
-          enemy.group.position.addScaledVector(direction, -enemy.speed * delta);
+      if (enemy.kind === 'artillery') {
+        if (distance < 5)
+          enemy.group.position.addScaledVector(direction, -enemy.speed * step);
+        if (enemy.shootTimer <= 0) {
+          this.createDangerZone(
+            playerPosition.clone(),
+            enemy.elite ? 2.1 : 1.5,
+            1.35,
+            22,
+          );
+          enemy.shootTimer = enemy.elite ? 2.6 : 3.5;
+        }
+      } else if (enemy.kind === 'ravager') {
+        if (enemy.charge > 0) {
+          enemy.charge -= delta;
+          material.emissiveIntensity = 4;
+          if (enemy.charge <= 0) enemy.charge = -0.65;
+        } else if (enemy.charge < 0) {
+          enemy.group.position.addScaledVector(
+            enemy.chargeDirection,
+            step * 11,
+          );
+          enemy.charge = Math.min(0, enemy.charge + delta);
         } else {
-          enemy.group.position.x += direction.z * enemy.orbit * delta * 1.1;
-          enemy.group.position.z -= direction.x * enemy.orbit * delta * 1.1;
+          enemy.group.position.addScaledVector(direction, enemy.speed * step);
+          if (enemy.shootTimer <= 0) {
+            enemy.chargeDirection.copy(direction);
+            enemy.charge = 0.85;
+            enemy.shootTimer = 4.8;
+            this.createDangerZone(
+              enemy.group.position.clone().addScaledVector(direction, 3),
+              0.65,
+              0.85,
+              0,
+            );
+          }
+        }
+        if (distance < 1.25 && enemy.attackTimer <= 0) {
+          this.damagePlayer(enemy.damage * (enemy.elite ? 1.25 : 1));
+          enemy.attackTimer = 1.1;
+        }
+      } else if (enemy.kind === 'spectre') {
+        if (distance > 5.6) {
+          enemy.group.position.addScaledVector(direction, enemy.speed * step);
+        } else if (distance < 3.6) {
+          enemy.group.position.addScaledVector(direction, -enemy.speed * step);
+        } else {
+          enemy.group.position.x += direction.z * enemy.orbit * step * 1.1;
+          enemy.group.position.z -= direction.x * enemy.orbit * step * 1.1;
         }
         if (enemy.shootTimer <= 0) {
           this.fireEnemyProjectile(enemy, 8.5, 9);
+          if (enemy.elite)
+            this.fireEnemyProjectile(
+              enemy,
+              7.5,
+              11,
+              direction
+                .clone()
+                .applyAxisAngle(new THREE.Vector3(0, 1, 0), 0.18),
+            );
           enemy.shootTimer = 2.1 - Math.min(0.5, this.wave * 0.1);
         }
       } else if (enemy.kind === 'leech') {
@@ -1384,7 +2066,7 @@ export class RiftEngine {
         if (toRift.length() > 1.8) {
           enemy.group.position.addScaledVector(
             toRift.normalize(),
-            enemy.speed * delta,
+            enemy.speed * step,
           );
         } else if (enemy.healTimer <= 0) {
           this.riftProgress = Math.max(0, this.riftProgress - 2.5);
@@ -1395,8 +2077,18 @@ export class RiftEngine {
           enemy.healTimer = 1.25;
         }
       } else if (enemy.kind === 'boss') {
+        const nextPhase = bossPhaseAt(enemy.hp / enemy.maxHp, enemy.bossPhase);
+        if (nextPhase > enemy.bossPhase) {
+          enemy.bossPhase = nextPhase;
+          this.showMessage(
+            `TYRAN // PHASE ${nextPhase} — ${nextPhase === 2 ? 'INVOCATION' : 'CONVERGENCE'}`,
+            3,
+          );
+          for (let summon = 0; summon < nextPhase; summon += 1)
+            this.spawnEnemy(summon % 2 ? 'artillery' : 'stalker');
+        }
         if (distance > 4.1) {
-          enemy.group.position.addScaledVector(direction, enemy.speed * delta);
+          enemy.group.position.addScaledVector(direction, enemy.speed * step);
         }
         const halo = enemy.group.userData.halo as THREE.Mesh;
         halo.rotation.x += delta * 0.45;
@@ -1404,8 +2096,9 @@ export class RiftEngine {
         const core = enemy.group.userData.core as THREE.Mesh;
         core.rotation.y += delta * 1.8;
         if (enemy.shootTimer <= 0) {
-          for (let index = 0; index < 10; index += 1) {
-            const angle = (index / 10) * Math.PI * 2;
+          const bolts = 8 + enemy.bossPhase * 2;
+          for (let index = 0; index < bolts; index += 1) {
+            const angle = (index / bolts) * Math.PI * 2 + this.elapsed * 0.3;
             this.fireEnemyProjectile(
               enemy,
               6.2,
@@ -1413,8 +2106,11 @@ export class RiftEngine {
               new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle)),
             );
           }
-          this.createDangerZone(playerPosition.clone(), 2.2, 0.95, 28);
-          enemy.shootTimer = enemy.hp / enemy.maxHp < 0.5 ? 2.05 : 2.8;
+          if (enemy.bossPhase >= 2)
+            this.createDangerZone(playerPosition.clone(), 2.2, 1.2, 28);
+          if (enemy.bossPhase >= 3)
+            this.createDangerZone(this.riftTarget.clone(), 2.6, 1.65, 30);
+          enemy.shootTimer = 3.4 - enemy.bossPhase * 0.4;
           this.shake = 0.38;
         }
         if (enemy.attackTimer <= 0 && distance < 2.4) {
@@ -1423,9 +2119,9 @@ export class RiftEngine {
         }
       } else {
         if (distance > enemy.radius + 0.62) {
-          enemy.group.position.addScaledVector(direction, enemy.speed * delta);
+          enemy.group.position.addScaledVector(direction, enemy.speed * step);
         } else if (enemy.attackTimer <= 0) {
-          this.damagePlayer(enemy.damage);
+          this.damagePlayer(enemy.damage * (enemy.elite ? 1.25 : 1));
           enemy.attackTimer = enemy.kind === 'guardian' ? 1.4 : 0.92;
         }
       }
@@ -1446,15 +2142,125 @@ export class RiftEngine {
     }
   }
 
-  private damageEnemy(enemy: Enemy, amount: number, impact: THREE.Vector3) {
+  private gainExperience(amount: number) {
+    this.experience += amount;
+    while (this.experience >= experienceForLevel(this.level)) {
+      this.experience -= experienceForLevel(this.level);
+      this.level += 1;
+      this.pendingLevels += 1;
+    }
+  }
+
+  private applyElementalImpact(enemy: Enemy, damage: number) {
+    if (this.phase !== 'playing') return;
+    const character = this.career.character;
+    const alive = this.enemies.includes(enemy);
+    const burnRank = this.rank('ember') + Number(character === 'kaela');
+    const slowRank = this.rank('stasis') + Number(character === 'elias');
+    const markRank = this.rank('void-mark') + Number(character === 'nyx');
+    if (alive && burnRank > 0) {
+      enemy.burn = Math.max(enemy.burn, 3);
+      enemy.burnPower = Math.max(enemy.burnPower, 5 * burnRank);
+    }
+    if (alive && slowRank > 0) enemy.slow = 1.2 + 0.6 * slowRank;
+    if (alive && markRank > 0) {
+      enemy.marks += 1;
+      if (enemy.marks >= 3) {
+        enemy.marks = 0;
+        this.damageEnemy(
+          enemy,
+          damage * (0.8 + 0.35 * markRank),
+          enemy.group.position,
+        );
+      }
+    }
+    // Secondary hits intentionally do not call applyElementalImpact: no recursive chains.
+    const chainCount = this.rank('chain') + Number(character === 'orin');
+    if (chainCount > 0) {
+      const targets = this.enemies
+        .filter(
+          (target) =>
+            target !== enemy &&
+            distance2D(target.group.position, enemy.group.position) < 3.8,
+        )
+        .sort(
+          (a, b) =>
+            distance2D(a.group.position, enemy.group.position) -
+            distance2D(b.group.position, enemy.group.position),
+        )
+        .slice(0, chainCount);
+      for (const target of targets) {
+        this.spawnParticles(target.group.position, 0x75eaff, 3);
+        this.damageEnemy(target, damage * 0.35, target.group.position);
+      }
+    }
+  }
+
+  private spawnPickup(position: THREE.Vector3) {
+    if (this.pickups.length >= 48 || Math.random() > 0.42) return;
+    const roll = Math.random();
+    const kind = roll < 0.3 ? 'health' : roll < 0.6 ? 'mana' : 'essence';
+    const mesh = new THREE.Mesh(
+      kind === 'health'
+        ? new THREE.BoxGeometry(0.23, 0.23, 0.23)
+        : kind === 'mana'
+          ? new THREE.OctahedronGeometry(0.22)
+          : new THREE.TetrahedronGeometry(0.25),
+      new THREE.MeshBasicMaterial({
+        color: { health: 0x9df2b0, mana: 0x75eaff, essence: 0xffd37a }[kind],
+      }),
+    );
+    mesh.position.copy(position).setY(0.35);
+    this.effectRoot.add(mesh);
+    this.pickups.push({ mesh, kind, life: 22 });
+  }
+
+  private updatePickups(delta: number) {
+    for (let index = this.pickups.length - 1; index >= 0; index -= 1) {
+      const pickup = this.pickups[index];
+      pickup.life -= delta;
+      pickup.mesh.rotation.y += delta * 2;
+      const distance = distance2D(pickup.mesh.position, this.player.position);
+      if (distance < 3 + this.rank('soul-siphon') * 0.5)
+        pickup.mesh.position.lerp(
+          this.player.position.clone().setY(0.35),
+          Math.min(1, delta * 5),
+        );
+      if (distance < 0.85) {
+        if (pickup.kind === 'health')
+          this.health = Math.min(this.stats.maxHealth, this.health + 18);
+        if (pickup.kind === 'mana')
+          this.mana = Math.min(this.maxMana, this.mana + 25);
+        if (pickup.kind === 'essence') {
+          this.gainExperience(15);
+          this.score += 50;
+        }
+        pickup.life = 0;
+      }
+      if (pickup.life <= 0) {
+        this.effectRoot.remove(pickup.mesh);
+        this.disposeObject(pickup.mesh);
+        this.pickups.splice(index, 1);
+      }
+    }
+  }
+
+  private damageEnemy(
+    enemy: Enemy,
+    amount: number,
+    impact: THREE.Vector3,
+    silent = false,
+  ) {
+    if (!this.enemies.includes(enemy) || this.phase !== 'playing') return;
     enemy.hp -= amount;
     enemy.flashTimer = 0.08;
-    this.audio.play('hit');
-    this.spawnParticles(
-      impact,
-      ENEMY_COLORS[enemy.kind][0],
-      enemy.kind === 'boss' ? 5 : 2,
-    );
+    if (!silent) this.audio.play('hit');
+    if (!silent)
+      this.spawnParticles(
+        impact,
+        ENEMY_COLORS[enemy.kind][0],
+        enemy.kind === 'boss' ? 5 : 2,
+      );
     if (enemy.hp <= 0) this.killEnemy(enemy);
   }
 
@@ -1470,14 +2276,24 @@ export class RiftEngine {
     );
     this.disposeObject(enemy.group);
     this.score += scoreForKill(enemy.kind, this.wave) * Math.max(1, this.combo);
+    if (enemy.elite) this.score += scoreForKill(enemy.kind, this.wave);
+    this.kills += 1;
+    this.gainExperience(enemy.kind === 'boss' ? 120 : enemy.elite ? 28 : 14);
+    this.health = Math.min(
+      this.stats.maxHealth,
+      this.health + this.rank('soul-siphon'),
+    );
+    if (enemy.kind !== 'boss') this.spawnPickup(enemy.group.position);
     this.combo = Math.min(9, this.combo + 1);
     this.comboTimer = 2.8;
+    this.bestCombo = Math.max(this.bestCombo, this.combo);
     this.ultimate = clamp(
-      this.ultimate + (enemy.kind === 'boss' ? 100 : 9),
+      this.ultimate +
+        (enemy.kind === 'boss' ? 100 : 9 + this.rank('convergence') * 2),
       0,
       100,
     );
-    if (this.wave < 4) {
+    if (!isBossWave(this.wave)) {
       this.voidPressure = Math.max(
         0,
         this.voidPressure - (enemy.kind === 'leech' ? 4.5 : 1.2),
@@ -1485,12 +2301,25 @@ export class RiftEngine {
     }
     this.audio.play('kill');
 
-    if (enemy.kind === 'boss') this.finishRun(true);
+    if (enemy.kind === 'boss') {
+      this.completedCycles += 1;
+      if (this.career.mode === 'endless') {
+        this.saveCheckpoint();
+        this.setPhase('camp');
+      } else this.finishRun(true);
+    }
   }
 
   private damagePlayer(amount: number) {
+    if (!Number.isFinite(amount) || amount <= 0) return;
     if (this.invulnerable > 0 || this.phase !== 'playing') return;
-    const result = resolveDamage(this.health, this.shield, amount);
+    const result = resolveDamage(
+      this.health,
+      this.shield,
+      amount *
+        DIFFICULTIES[this.career.difficulty].damage *
+        Math.min(2, this.threat),
+    );
     this.health = result.health;
     this.shield = result.shield;
     this.invulnerable = 0.36;
@@ -1505,6 +2334,7 @@ export class RiftEngine {
 
   private fireBolt() {
     if (this.shotTimer > 0 || this.phase !== 'playing') return;
+    if (this.projectiles.length >= 220) return;
     const origin = this.player.position.clone();
     origin.y = 0.82;
     const baseDirection = this.aimPoint.clone().sub(origin);
@@ -1519,7 +2349,9 @@ export class RiftEngine {
         .applyAxisAngle(new THREE.Vector3(0, 1, 0), offset * 0.12);
       const mesh = new THREE.Mesh(
         new THREE.OctahedronGeometry(0.12, 0),
-        new THREE.MeshBasicMaterial({ color: 0xa7f4ff }),
+        new THREE.MeshBasicMaterial({
+          color: characterById(this.career.character).hex,
+        }),
       );
       mesh.position.copy(origin);
       mesh.scale.set(0.72, 0.72, 1.7);
@@ -1546,6 +2378,7 @@ export class RiftEngine {
     damage: number,
     requestedDirection?: THREE.Vector3,
   ) {
+    if (this.projectiles.length >= 220) return;
     const origin = enemy.group.position.clone();
     const direction =
       requestedDirection ??
@@ -1625,6 +2458,7 @@ export class RiftEngine {
               projectile.damage,
               projectile.mesh.position,
             );
+            this.applyElementalImpact(enemy, projectile.damage);
             if (projectile.pierce > 0) {
               projectile.pierce -= 1;
               projectile.damage *= 0.82;
@@ -1659,11 +2493,29 @@ export class RiftEngine {
       this.showMessage(`PUITS // ${Math.ceil(this.gravityCooldown)}S`, 0.7);
       return;
     }
+    if (this.mana < 30) {
+      this.showMessage('ARCANE // 30 MANA REQUIS', 1);
+      return;
+    }
+    this.mana -= 30;
+    this.gravityCooldown = 8.5 * this.stats.gravityCooldownScale;
+    const caster = characterById(this.career.character);
+    if (caster.id === 'orin') {
+      this.createBlast(
+        this.aimPoint,
+        3.5,
+        75 * this.stats.gravityPower,
+        caster.hex,
+      );
+      this.audio.play('rift');
+      this.showMessage('FULGURANCE', 1);
+      return;
+    }
     const radius = 2.7 + this.stats.gravityPower * 0.45;
     const mesh = new THREE.Mesh(
       new THREE.RingGeometry(radius * 0.2, radius, 46),
       new THREE.MeshBasicMaterial({
-        color: 0x9b5cff,
+        color: caster.hex,
         transparent: true,
         opacity: 0.38,
         side: THREE.DoubleSide,
@@ -1674,17 +2526,22 @@ export class RiftEngine {
     mesh.scale.setScalar(0.12);
     this.effectRoot.add(mesh);
     this.areas.push({
-      kind: 'gravity',
+      kind:
+        caster.id === 'kaela'
+          ? 'flame'
+          : caster.id === 'elias'
+            ? 'stasis'
+            : 'gravity',
       mesh,
       life: 3.1,
       duration: 3.1,
       radius,
-      damage: 8 * this.stats.gravityPower,
+      damage: (caster.id === 'kaela' ? 14 : 8) * this.stats.gravityPower,
       tick: 0,
     });
     this.gravityCooldown = 8.5 * this.stats.gravityCooldownScale;
     this.audio.play('rift');
-    this.showMessage('PUITS GRAVITATIONNEL', 1);
+    this.showMessage(caster.secondary, 1);
   }
 
   private castShield() {
@@ -1692,6 +2549,11 @@ export class RiftEngine {
       this.showMessage(`ÉGIDE // ${Math.ceil(this.shieldCooldown)}S`, 0.7);
       return;
     }
+    if (this.mana < 20) {
+      this.showMessage('ÉGIDE // 20 MANA REQUIS', 1);
+      return;
+    }
+    this.mana -= 20;
     this.shield = Math.min(
       this.stats.shieldPower * 1.6,
       this.shield + this.stats.shieldPower,
@@ -1777,12 +2639,37 @@ export class RiftEngine {
       return;
     }
     this.ultimate = 0;
+    this.runUltimates += 1;
     this.invulnerable = 1.1;
     this.audio.play('ultimate');
     this.clearHostileProjectiles();
     this.shake = this.reducedMotion ? 0 : 0.9;
-    this.showMessage('BRISURE DIMENSIONNELLE', 1.8);
-    this.createBlast(this.player.position, 8.5, 210, 0xf086ff);
+    const caster = characterById(this.career.character);
+    this.showMessage(caster.ultimate, 1.8);
+    if (caster.id === 'elias') {
+      this.health = Math.min(this.stats.maxHealth, this.health + 45);
+      this.enemies.forEach((enemy) => {
+        enemy.slow = 7;
+        if (enemy.kind !== 'boss') enemy.freeze = 4;
+      });
+    }
+    if (caster.id === 'nyx')
+      this.enemies.forEach((enemy) => {
+        if (enemy.kind !== 'boss')
+          enemy.group.position.lerp(this.player.position, 0.7);
+      });
+    if (caster.id === 'kaela')
+      this.enemies.forEach((enemy) => {
+        enemy.burn = 6;
+        enemy.burnPower = 20;
+      });
+    this.createBlast(
+      this.player.position,
+      caster.id === 'orin' ? 12 : 8.5,
+      (caster.id === 'elias' ? 150 : 210) *
+        (1 + this.rank('convergence') * 0.25),
+      caster.hex,
+    );
   }
 
   private createBlast(
@@ -1862,7 +2749,11 @@ export class RiftEngine {
       const progress = 1 - clamp(area.life / area.duration, 0, 1);
       const material = area.mesh.material as THREE.MeshBasicMaterial;
 
-      if (area.kind === 'gravity') {
+      if (
+        area.kind === 'gravity' ||
+        area.kind === 'flame' ||
+        area.kind === 'stasis'
+      ) {
         area.mesh.scale.setScalar(Math.min(1, progress * 5));
         area.mesh.rotation.z -= delta * 1.8;
         area.tick -= delta;
@@ -1870,11 +2761,24 @@ export class RiftEngine {
           const toCenter = area.mesh.position.clone().sub(enemy.group.position);
           toCenter.y = 0;
           const distance = toCenter.length();
-          if (distance < area.radius && distance > 0.2) {
-            enemy.group.position.addScaledVector(
-              toCenter.normalize(),
-              delta * (2.8 + this.stats.gravityPower * 1.4),
-            );
+          if (distance < area.radius) {
+            if (area.kind === 'gravity' && distance > 0.2)
+              enemy.group.position.addScaledVector(
+                toCenter.normalize(),
+                delta * (2.8 + this.stats.gravityPower * 1.4),
+              );
+            if (area.kind === 'stasis') {
+              enemy.slow = Math.max(enemy.slow, 2);
+              if (enemy.kind !== 'boss')
+                enemy.freeze = Math.max(enemy.freeze, 0.5);
+            }
+            if (area.kind === 'flame') {
+              enemy.burn = Math.max(enemy.burn, 3);
+              enemy.burnPower = Math.max(
+                enemy.burnPower,
+                6 + this.rank('ember') * 4,
+              );
+            }
             if (area.tick <= 0) {
               this.damageEnemy(enemy, area.damage, enemy.group.position);
               if (this.phase !== 'playing') break;
@@ -2022,8 +2926,22 @@ export class RiftEngine {
   private resetRun() {
     this.clearEntities();
     this.stats = this.defaultStats();
+    const caster = characterById(this.career.character);
+    this.stats.maxHealth = caster.health;
+    this.stats.boltDamage = caster.damage;
     this.upgradeRanks.clear();
     this.wave = 1;
+    this.cycle = 1;
+    this.completedCycles = 0;
+    this.level = 1;
+    this.experience = 0;
+    this.pendingLevels = 0;
+    this.kills = 0;
+    this.runUltimates = 0;
+    this.bestCombo = 0;
+    this.newAchievements = [];
+    this.mana = 100;
+    this.upgradeReason = 'rift';
     this.riftProgress = 0;
     this.voidPressure = 0;
     this.riftsStabilized = 0;
@@ -2056,6 +2974,7 @@ export class RiftEngine {
     this.gamepadButtons.clear();
     this.shieldMesh.visible = false;
     this.moveRiftToWave();
+    this.applyCharacter();
     this.lastFrameTime = performance.now() / 1000;
     this.pushHud(true);
   }
@@ -2082,6 +3001,37 @@ export class RiftEngine {
           victory,
         });
     if (!this.qaMode) {
+      this.checkpoint = null;
+      this.career.kills += this.kills;
+      this.career.rifts += this.riftsStabilized;
+      this.career.ultimates += this.runUltimates;
+      this.career.bestCombo = Math.max(this.career.bestCombo, this.bestCombo);
+      if (
+        this.completedCycles > 0 &&
+        !this.career.characterWins.includes(this.career.character)
+      )
+        this.career.characterWins.push(this.career.character);
+      if (this.career.mode === 'endless')
+        this.career.bestCycle = Math.max(
+          this.career.bestCycle,
+          this.completedCycles,
+        );
+      this.newAchievements = awardAchievements(this.career);
+      this.career.achievements.push(...this.newAchievements);
+      this.career.history.unshift({
+        character: this.career.character,
+        mode: this.career.mode,
+        difficulty: this.career.difficulty,
+        score: this.score,
+        kills: this.kills,
+        rifts: this.riftsStabilized,
+        cycles: this.completedCycles,
+        level: this.level,
+        seconds: Math.floor(this.elapsed),
+        victory,
+        date: new Date().toISOString(),
+      });
+      this.career.history = this.career.history.slice(0, 20);
       this.highScore = Math.max(this.highScore, this.score);
       this.runsCompleted += 1;
       if (victory) this.victories += 1;
@@ -2098,6 +3048,11 @@ export class RiftEngine {
   }
 
   private clearEntities() {
+    this.pickups.forEach(({ mesh }) => {
+      this.effectRoot.remove(mesh);
+      this.disposeObject(mesh);
+    });
+    this.pickups = [];
     this.enemies.forEach((enemy) => {
       this.enemyRoot.remove(enemy.group);
       this.disposeObject(enemy.group);
@@ -2148,6 +3103,7 @@ export class RiftEngine {
   private setPhase(phase: GamePhase) {
     this.phase = phase;
     if (phase !== 'playing') {
+      this.touchChannel = false;
       this.keys.clear();
       this.mouseHeld = false;
       this.touchAttack = false;
@@ -2168,6 +3124,23 @@ export class RiftEngine {
       },
     );
     this.callbacks.onHud({
+      character: this.career.character,
+      mode: this.career.mode,
+      difficulty: this.career.difficulty,
+      career: this.career,
+      cycle: this.cycle,
+      level: this.level,
+      experience: this.experience,
+      nextLevelExperience: experienceForLevel(this.level),
+      mana: this.mana,
+      maxMana: this.maxMana,
+      kills: this.kills,
+      bossPhase: boss?.bossPhase ?? 0,
+      upgradeReason: this.upgradeReason,
+      newAchievements: this.newAchievements,
+      qaMode: this.qaMode,
+      checkpointCycle: this.checkpoint?.cycle ?? null,
+      storageConflict: this.storageConflict,
       health: this.health,
       maxHealth: this.stats.maxHealth,
       shield: this.shield,
@@ -2206,8 +3179,12 @@ export class RiftEngine {
   private loadSave() {
     try {
       const currentRaw = window.localStorage.getItem(PROGRESSION_STORAGE_KEY);
+      this.lastSavedRaw = currentRaw;
       const legacyRaw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
       const profile = readProgression(currentRaw, legacyRaw);
+      this.career = profile.career;
+      this.checkpoint = profile.checkpoint;
+      if (this.qaMode) this.checkpoint = null;
       this.highScore = profile.highScore;
       this.dust = profile.dust;
       this.muted = profile.muted;
@@ -2216,6 +3193,15 @@ export class RiftEngine {
       this.unlockedAffinities = { ...profile.unlockedAffinities };
       this.affinity = profile.equippedAffinity;
       this.audio.setMuted(this.muted);
+      if (!this.qaMode) {
+        try {
+          const probe = `riftcasters-storage-probe-${Math.random().toString(36).slice(2)}`;
+          window.localStorage.setItem(probe, '1');
+          window.localStorage.removeItem(probe);
+        } catch {
+          this.storageAvailable = false;
+        }
+      }
       if (!isValidCurrentProgression(currentRaw) && legacyRaw) {
         this.saveProgress();
       }
@@ -2234,20 +3220,18 @@ export class RiftEngine {
 
   private saveProgress() {
     if (this.qaMode) return true;
+    if (this.storageConflict) return false;
     try {
-      window.localStorage.setItem(
-        PROGRESSION_STORAGE_KEY,
-        JSON.stringify({
-          version: 2,
-          highScore: this.highScore,
-          dust: this.dust,
-          muted: this.muted,
-          runsCompleted: this.runsCompleted,
-          victories: this.victories,
-          unlockedAffinities: this.unlockedAffinities,
-          equippedAffinity: this.affinity,
-        }),
-      );
+      if (
+        window.localStorage.getItem(PROGRESSION_STORAGE_KEY) !==
+        this.lastSavedRaw
+      ) {
+        this.markStorageConflict();
+        return false;
+      }
+      const raw = this.exportSave();
+      window.localStorage.setItem(PROGRESSION_STORAGE_KEY, raw);
+      this.lastSavedRaw = raw;
       this.storageAvailable = true;
       return true;
     } catch {

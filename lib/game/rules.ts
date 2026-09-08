@@ -71,15 +71,14 @@ export function dashRechargeTime(upgradeLevel: number) {
   return clamp(5.2 - Math.max(0, upgradeLevel) * 0.75, 2.6, 5.2);
 }
 
-export function scoreForKill(
-  kind: 'stalker' | 'spectre' | 'guardian' | 'leech' | 'boss',
-  wave: number,
-) {
+export function scoreForKill(kind: import('./types').EnemyKind, wave: number) {
   const base = {
     stalker: 100,
     spectre: 135,
     guardian: 220,
     leech: 175,
+    artillery: 190,
+    ravager: 240,
     boss: 5000,
   }[kind];
   return Math.round(base * (1 + Math.max(0, wave - 1) * 0.18));
@@ -101,6 +100,8 @@ export function nextRiftPosition(wave: number) {
     { x: 0, z: 0 },
     { x: 4.6, z: -3.2 },
     { x: -4.8, z: 2.4 },
+    { x: -3.6, z: -4.4 },
+    { x: 4.2, z: 4.1 },
   ];
   return positions[(Math.max(1, wave) - 1) % positions.length];
 }

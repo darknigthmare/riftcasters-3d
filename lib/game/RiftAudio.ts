@@ -71,6 +71,7 @@ export class RiftAudio {
   private master: GainNode | null = null;
   private ambient: OscillatorNode[] = [];
   private muted = false;
+  private volume = 0.65;
 
   async unlock() {
     try {
@@ -85,7 +86,7 @@ export class RiftAudio {
       if (!AudioConstructor) return;
       this.context = new AudioConstructor();
       this.master = this.context.createGain();
-      this.master.gain.value = this.muted ? 0 : 0.5;
+      this.master.gain.value = this.muted ? 0 : this.volume * 0.65;
       this.master.connect(this.context.destination);
       this.startAmbience();
     } catch {
@@ -97,11 +98,16 @@ export class RiftAudio {
     this.muted = muted;
     if (this.context && this.master) {
       this.master.gain.setTargetAtTime(
-        muted ? 0 : 0.5,
+        muted ? 0 : this.volume * 0.65,
         this.context.currentTime,
         0.025,
       );
     }
+  }
+
+  setVolume(volume: number) {
+    this.volume = Math.max(0, Math.min(1, volume));
+    this.setMuted(this.muted);
   }
 
   play(name: TonePreset) {

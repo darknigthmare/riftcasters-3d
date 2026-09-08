@@ -1,19 +1,21 @@
 {
   "name": "riftcasters-3d",
-  "version": "0.1.0",
+  "version": "1.0.0-rc.1",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
   },
   "scripts": {
     "dev": "vite --config vite.static.config.ts",
-    "build": "vite build --config vite.static.config.ts",
+    "build": "vite build --config vite.static.config.ts && node tools/package-release.mjs",
     "preview": "vite preview --config vite.static.config.ts",
     "start": "vite preview --config vite.static.config.ts --host 0.0.0.0",
     "lint": "oxlint",
     "format": "oxfmt",
     "typecheck": "tsc --noEmit --incremental false",
     "test": "vitest --config vitest.config.ts run",
+    "test:e2e": "playwright test",
+    "package:release": "node tools/package-release.mjs",
     "qa": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
@@ -28,6 +30,7 @@
     "three": "^0.185.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",

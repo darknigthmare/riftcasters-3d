@@ -4,9 +4,17 @@ export type GamePhase =
   | 'paused'
   | 'upgrade'
   | 'gameover'
-  | 'victory';
+  | 'victory'
+  | 'camp';
 
-export type EnemyKind = 'stalker' | 'spectre' | 'guardian' | 'leech' | 'boss';
+export type EnemyKind =
+  | 'stalker'
+  | 'spectre'
+  | 'guardian'
+  | 'leech'
+  | 'artillery'
+  | 'ravager'
+  | 'boss';
 
 export type AbilityId = 'gravity' | 'shield' | 'dash' | 'ultimate';
 
@@ -17,6 +25,23 @@ export type Affinity = 'none' | AffinityId;
 export type AffinityUnlocks = Record<AffinityId, boolean>;
 
 export type HudSnapshot = {
+  character: import('./content').CharacterId;
+  mode: import('./content').RunMode;
+  difficulty: import('./content').Difficulty;
+  career: import('./career').Career;
+  cycle: number;
+  level: number;
+  experience: number;
+  nextLevelExperience: number;
+  mana: number;
+  maxMana: number;
+  kills: number;
+  bossPhase: number;
+  upgradeReason: 'rift' | 'level';
+  newAchievements: string[];
+  qaMode: boolean;
+  checkpointCycle: number | null;
+  storageConflict: boolean;
   health: number;
   maxHealth: number;
   shield: number;
@@ -55,7 +80,14 @@ export type UpgradeId =
   | 'rift-step'
   | 'void-well'
   | 'vital-surge'
-  | 'echo-burst';
+  | 'echo-burst'
+  | 'ember'
+  | 'chain'
+  | 'stasis'
+  | 'void-mark'
+  | 'mana-flow'
+  | 'soul-siphon'
+  | 'convergence';
 
 export type UpgradeChoice = {
   id: UpgradeId;

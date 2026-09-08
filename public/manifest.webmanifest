@@ -1,0 +1,13 @@
+{
+  "id": "/",
+  "name": "RIFTCASTERS 3D — Convergence",
+  "short_name": "RIFTCASTERS",
+  "description": "Quatre Riftcasters, cinq failles et une Arche à sauver. Expédition et Endurance en solo.",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#03040b",
+  "theme_color": "#03040b",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

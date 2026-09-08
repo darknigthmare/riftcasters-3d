@@ -43,7 +43,7 @@ describe('rift pacing', () => {
     expect(spawnIntervalForWave(1, true)).toBeLessThan(spawnIntervalForWave(1));
   });
 
-  it('uses three distinct rift positions before cycling', () => {
+  it('uses five distinct rift positions before cycling', () => {
     const first = nextRiftPosition(1);
     const second = nextRiftPosition(2);
     const third = nextRiftPosition(3);
@@ -51,7 +51,14 @@ describe('rift pacing', () => {
       new Set([first, second, third].map((value) => JSON.stringify(value)))
         .size,
     ).toBe(3);
-    expect(nextRiftPosition(4)).toEqual(first);
+    expect(
+      new Set(
+        Array.from({ length: 5 }, (_, index) =>
+          JSON.stringify(nextRiftPosition(index + 1)),
+        ),
+      ).size,
+    ).toBe(5);
+    expect(nextRiftPosition(6)).toEqual(first);
   });
 
   it('turns contesting enemies into pressure while clean channeling relieves it', () => {
