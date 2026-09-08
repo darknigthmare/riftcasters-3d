@@ -124,6 +124,8 @@ export function CommandCenter({
     initialSection,
   );
   const [notice, setNotice] = useState('');
+  const [downloadNotice, setDownloadNotice] = useState('');
+  const downloading = useRef(false);
   const [pendingSave, setPendingSave] = useState<string | null>(null);
   useEffect(() => {
     const element = dialog.current;
@@ -144,6 +146,43 @@ export function CommandCenter({
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     setNotice('Sauvegarde exportée. Conserve ce fichier hors du navigateur.');
+  };
+  const downloadStandalone = async () => {
+    if (downloading.current) return;
+    downloading.current = true;
+    setDownloadNotice('Préparation du fichier autonome…');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch('/RIFTCASTERS_3D_PLAY.bin', {
+        signal: controller.signal,
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error('Download unavailable');
+      // A Blob discards hosting Content-Disposition filenames, preserving .html.
+      const url = URL.createObjectURL(
+        new Blob([await response.arrayBuffer()], {
+          type: 'text/html;charset=utf-8',
+        }),
+      );
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'RIFTCASTERS_3D_PLAY.html';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setDownloadNotice(
+        'Téléchargement lancé. Ouvre le fichier HTML pour jouer sans réseau.',
+      );
+    } catch {
+      setDownloadNotice(
+        'Téléchargement indisponible. Reconnecte-toi puis réessaie ; ta sauvegarde reste intacte.',
+      );
+    } finally {
+      clearTimeout(timeout);
+      downloading.current = false;
+    }
   };
   return (
     <dialog
@@ -469,6 +508,10 @@ export function CommandCenter({
             <a
               href="/RIFTCASTERS_3D_PLAY.bin"
               download="RIFTCASTERS_3D_PLAY.html"
+              onClick={(event) => {
+                event.preventDefault();
+                void downloadStandalone();
+              }}
             >
               Télécharger le jeu autonome
             </a>
@@ -477,6 +520,7 @@ export function CommandCenter({
             </a>
           </>
         )}
+        <output aria-live="polite">{downloadNotice}</output>
       </footer>
     </dialog>
   );
