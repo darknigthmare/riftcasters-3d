@@ -1,6 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
 
 const ready = async (page: Page, path = '/?qa=1') => {
   await page.goto(path);
@@ -447,6 +448,28 @@ test('standalone HTML starts the same 3D game directly from disk without network
   await expect(phase(page)).toHaveAttribute('data-game-state', 'playing');
   expect(network).toEqual([]);
   expect(errors).toEqual([]);
+});
+
+test('the download keeps the exact standalone bytes and an HTML filename', async ({
+  page,
+}) => {
+  await ready(page, '/');
+  await page
+    .getByRole('button', { name: 'GUIDE · PARAMÈTRES · SUCCÈS' })
+    .click();
+  const pending = page.waitForEvent('download');
+  await page.getByRole('link', { name: 'Télécharger le jeu autonome' }).click();
+  const download = await pending;
+  expect(download.suggestedFilename()).toBe('RIFTCASTERS_3D_PLAY.html');
+  const path = await download.path();
+  expect(path).not.toBeNull();
+  const html = await readFile(path!, 'utf8');
+  expect(html).toContain('<script type="module">');
+  expect(html).not.toMatch(/<script[^>]+src="/);
+  if (!process.env.RIFT_TEST_URL)
+    expect(html).toBe(
+      await readFile('dist/release/RIFTCASTERS_3D_PLAY.html', 'utf8'),
+    );
 });
 
 test('Stase never shortens Rémanence and expired Supernova does not contaminate later burns', async ({

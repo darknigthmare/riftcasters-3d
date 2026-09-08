@@ -467,7 +467,7 @@ export function CommandCenter({
         {import.meta.env.PROD && location.protocol !== 'file:' && (
           <>
             <a
-              href="/RIFTCASTERS_3D_PLAY.html"
+              href="/RIFTCASTERS_3D_PLAY.bin"
               download="RIFTCASTERS_3D_PLAY.html"
             >
               Télécharger le jeu autonome

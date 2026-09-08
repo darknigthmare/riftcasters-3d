@@ -104,6 +104,12 @@ for (const name of [
   await copyFile(name, `dist/release/${name.split('/').at(-1)}`);
 await mkdir('dist/client', { recursive: true });
 await copyFile(`dist/release/${filename}`, `dist/client/${filename}`);
+// Serve the download as binary: hosting shells must not inject scripts into it.
+// The UI supplies the .html download filename; the ordinary HTML remains useful on Vercel.
+await copyFile(
+  `dist/release/${filename}`,
+  'dist/client/RIFTCASTERS_3D_PLAY.bin',
+);
 await copyFile(
   'dist/release/THIRD_PARTY_NOTICES.txt',
   'dist/client/THIRD_PARTY_NOTICES.txt',
